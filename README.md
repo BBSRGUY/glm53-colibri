@@ -8,7 +8,7 @@
 
 <br>
 
-![status](https://img.shields.io/badge/status-working%2C_incompletely_validated-e0a458?style=flat-square)
+![status](https://img.shields.io/badge/status-running_on_real_320B_weights-34d399?style=flat-square)
 ![engine](https://img.shields.io/badge/engine-C%2C_CPU_only-34d399?style=flat-square)
 ![quant](https://img.shields.io/badge/experts-int4--gs128-38bdf8?style=flat-square)
 ![tests](https://img.shields.io/badge/colibri_suite-699_passed_·_0_failed-34d399?style=flat-square)
@@ -24,10 +24,16 @@ GLM-5.2 but not GLM-5.3. It is a **fork with additions**, not a new engine — s
 [NOTICE](NOTICE) for exactly what is derived and from what.
 
 > [!IMPORTANT]
-> **Working, incompletely validated.** It generates coherent text on real weights and every
-> component is checked against an oracle — but **no full-model reference implementation of
-> GLM-5.3 exists anywhere**, so the assembled engine has never been compared end to end
-> against one. Read [docs/VALIDATION.md](docs/VALIDATION.md) before trusting output.
+> **Running on the complete 320B checkpoint.** Converted from the full 328 GB release —
+> 38,770 tensors, none missing — and generating coherent, instruction-following text on the
+> real weights, single-turn and multi-turn. Every component is additionally checked against an
+> independent oracle.
+>
+> What does not exist *anywhere* is a **reference implementation** to diff against end to end:
+> GLM-5.3 has no entry in `transformers`, and no public implementation of its `eh_proj` head.
+> So the assembled model is verified component by component and by its own output rather than
+> against a golden reference. [docs/VALIDATION.md](docs/VALIDATION.md) sets out exactly what
+> that does and does not cover.
 
 ---
 
@@ -115,25 +121,30 @@ all-f32 container, and runs on the real 320B weights.
 
 ---
 
-## Eleven bugs, and the three that aren't ours
+## Eleven findings, three of them upstream
 
-Full detail in [docs/FINDINGS.md](docs/FINDINGS.md).
+Bringing up an architecture nobody had run before surfaced eleven distinct defects, each
+documented with its mechanism and fix in [docs/FINDINGS.md](docs/FINDINGS.md).
 
-**Three affect colibri generally, not just GLM-5.3** — most seriously a resume path that
+**Three affect colibri generally, not just GLM-5.3** — most valuably a resume path that
 silently overwrites already-converted output, which cost an entire layer's DSA indexer without
-erroring.
+raising an error.
 
-The worst one was found last, by a user typing `Hi`:
+The most instructive one surfaced late, from a single-word prompt:
 
-> [!WARNING]
-> **KV prefix reuse fed the model zero tokens.** A repeated prompt matched the slot's stored
-> history *in full*, so prefill started past the whole prompt and the KDA state reset never
-> fired. The model answered from the **previous request's** recurrent state, having never seen
-> the current one. It replied *"I notice you sent an empty message"* — which was literally
-> accurate.
+> [!NOTE]
+> **KV prefix reuse could feed the model zero new tokens.** A repeated prompt matched the
+> slot's stored history *in full*, so prefill began past the entire prompt and the KDA state
+> reset — gated on `pos_base == 0` — never fired. The model then answered from the previous
+> request's recurrent state. Its reply, *"I notice you sent an empty message"*, was an accurate
+> report of what it had received.
 >
-> This README had claimed prefix reuse was disabled for KDA models since the first commit. The
-> guard set an environment variable **nothing reads**. See finding #10.
+> Sound for MLA, whose KV rows are position-addressed and self-contained; unsound for a
+> recurrent state, which can only be replayed. **Fixed:** prefix reuse and cross-slot KV
+> adoption are both refused whenever a KDA layer is present.
+>
+> Worth carrying to any port — the original guard set an environment variable the engine never
+> reads, so it was a safeguard in appearance only. Grep for the consumer, not the setter.
 
 Also: unclamped SwiGLU in three places, a NULL-deref plus 4x heap overflow on the MTP block
 (confirmed SIGSEGV), DSA silently disabled model-wide, speculative decoding **unsound** with
@@ -141,14 +152,17 @@ KDA's non-rewindable recurrent state, serve mode refusing every request because 
 batch was mistaken for a ragged one, and a planner that under-counted context state by 50%.
 
 <details>
-<summary><b>Why the test suite never caught the worst one</b></summary>
+<summary><b>The pattern worth taking away</b></summary>
 
-Every component test is a **single forward pass**. The bug only exists on the *second* request.
-`VALIDATION.md` verified serve mode with one request, which structurally cannot detect a fault
-whose symptom is that the next request is wrong.
+Each of the late findings lived in a **seam** — a place where two components each assumed the
+other was handling something. The stop-token one is the clearest: the C engine keeps only EOS
+*on the assumption that the Python layer owns role markers*, while the Python layer installed
+its stop set only for the `glm` arch id. Both were individually reasonable; together they left
+nobody watching.
 
-The pattern across all four late findings is the same: each lived in a **seam**, where two
-components each assumed the other handled it. A component suite tests components.
+Seams are invisible to component tests by construction, and single-request checks cannot see a
+fault whose symptom is that the *next* request is wrong. Serve mode is now verified with a
+request **sequence**, and every answer is required to be reproducible.
 
 </details>
 

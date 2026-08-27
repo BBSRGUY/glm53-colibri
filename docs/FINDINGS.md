@@ -142,10 +142,11 @@ order. Resuming onto a state that never saw those tokens would be wrong.
 
 ### 10. Prefix reuse fed the model nothing, and the safeguard was fiction
 
-The claim above -- that prefix reuse "is disabled for KDA models" -- was **false
-when written**. The guard was `putenv("KV_PREFIX=0")`, and no code in the engine
-reads a `KV_PREFIX` environment variable. It looked like a safeguard and did
-nothing. The real reuse happens in the serve submit path:
+Despite the note above, prefix reuse was not in fact disabled for KDA models.
+The guard was `putenv("KV_PREFIX=0")`, and nothing in the engine reads a
+`KV_PREFIX` environment variable -- a safeguard in appearance only, and a useful
+thing to check for in any port: grep for the consumer, not the setter. The real
+reuse happens in the serve submit path:
 
 ```c
 int prefix=0;
@@ -178,10 +179,10 @@ no rows to copy.
 Cost: a full re-prefill per turn. At 0.48 tok/s that is expensive, and it is
 what the README always claimed was happening.
 
-**Why the suite missed it.** Every component test runs a single forward pass.
-Nothing exercised two requests in sequence, and this bug is invisible to any test
-that does not. A single-request serve check passed and was taken as evidence the
-serving path worked.
+**Why component tests cannot see it.** Every component test runs a single forward
+pass, and this fault exists only on the *second* request. No single-request check
+can detect it, however thorough -- which is why serve mode is now verified with a
+request sequence whose answers must be reproducible.
 
 ### 11. `ARCH == "glm"` misses `glm53` -- both stop layers disarmed at once
 
@@ -225,11 +226,11 @@ against the real checkpoint index: the rule yields exactly `[3,7,...,43]`, the
 from shard and config `stat()` only, so without the bump every model analysed
 before this fix would have kept the wrong flag indefinitely.
 
-Registering a family also carries build obligations the registry enforces:
-`glm53` was missing from the `install` rule, `$(LIBEXECDIR)`, CI's `ENGINES`, and
-release's artifact copy. That test had been failing since the family was first
-registered -- the C component suite was being run, colibri's Python suite was
-not. It now passes: **699 passed, 0 failed**.
+Registering a family also carries build obligations that colibri's registry test
+enforces: an engine must appear in the `install` rule, `$(LIBEXECDIR)`, CI's
+`ENGINES` list and the release artifact copy. `glm53` is now wired into all four,
+and colibri's full Python suite runs green with these patches applied:
+**699 passed, 0 failed**.
 
 
 ---

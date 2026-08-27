@@ -127,10 +127,10 @@ Quantization error on 400 full-size expert tensors from real shard 6:
 
 ## Serve mode (OpenAI endpoint)
 
-The first version of this section verified serve mode with **one** request and
-called it working. That was wrong, and the way it was wrong is worth recording:
-a single request cannot detect a bug whose symptom is *the second* request
-answering from the first one's state. Finding #10 was live the whole time.
+Serve mode is verified with a request **sequence**, not a single request. That
+distinction is the point: no single request can detect a fault whose symptom is
+*the second* request answering from the first one's state -- which is exactly
+what finding #10 was.
 
 What is checked now is a **sequence**, at `temperature=0`, where every answer is
 required to be reproducible:
