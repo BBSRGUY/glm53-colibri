@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 900 300" width="900" height="300"
+     role="img" aria-label="glm53-colibri: GLM-5.3-Flash, 320B mixture-of-experts, streamed from NVMe on a laptop CPU">
+  <defs>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#34d399"/>
+      <stop offset="55%"  stop-color="#6ee7b7"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="fade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#34d399" stop-opacity="0"/>
+      <stop offset="50%"  stop-color="#34d399" stop-opacity=".85"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
+    </linearGradient>
+    <path id="flow" d="M 150 196 L 420 196 L 690 196"/>
+    <clipPath id="typeclip">
+      <rect x="470" y="96" width="0" height="34">
+        <animate attributeName="width" values="0;0;286;286;0"
+                 keyTimes="0;0.06;0.55;0.9;1" dur="7s" repeatCount="indefinite"/>
+      </rect>
+    </clipPath>
+  </defs>
+
+  <style>
+    .mono { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; }
+    .sans { font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, sans-serif; }
+    .dim  { fill: #94a3b8; }
+    .chip { fill: #0f1a17; stroke: #1e3a34; }
+    .box  { fill: #0e1614; stroke: #1f3d36; }
+    @keyframes blink { 0%,45%{opacity:1} 55%,100%{opacity:0} }
+    .cursor { animation: blink 1s steps(1) infinite; }
+    @keyframes rise { from{opacity:0; transform:translateY(6px)} to{opacity:1; transform:translateY(0)} }
+    .r1 { animation: rise .6s ease-out .1s both; }
+    .r2 { animation: rise .6s ease-out .3s both; }
+    .r3 { animation: rise .6s ease-out .5s both; }
+  </style>
+
+  <rect x="1" y="1" width="898" height="298" rx="18" fill="#080b0a" stroke="#16241f"/>
+  <rect x="1" y="1" width="898" height="4" rx="2" fill="url(#accent)" opacity=".9"/>
+
+  <!-- wordmark -->
+  <g class="r1">
+    <path d="M46 74 C46 56, 62 44, 80 46 C74 60, 62 70, 46 74 Z" fill="url(#accent)"/>
+    <text class="mono" x="96" y="72" font-size="34" font-weight="700" fill="#e8eef0">glm53-colibri</text>
+  </g>
+  <text class="sans r2" x="96" y="99" font-size="14.5" fill="#7dd3b0">
+    GLM-5.3-Flash · 320B total / 18B active · hybrid KDA + DSA · runs on a laptop
+  </text>
+
+  <!-- live reply, typed -->
+  <g class="r3">
+    <text class="mono" x="470" y="122" font-size="14" fill="#64748b">you: Hi</text>
+  </g>
+  <g clip-path="url(#typeclip)">
+    <text class="sans" x="470" y="152" font-size="15.5" fill="#6ee7b7">Hi! How can I help you today?</text>
+  </g>
+  <rect class="cursor" x="470" y="139" width="2" height="16" fill="#34d399">
+    <animate attributeName="x" values="470;470;756;756;470" keyTimes="0;0.06;0.55;0.9;1"
+             dur="7s" repeatCount="indefinite"/>
+  </rect>
+
+  <!-- pipeline -->
+  <line x1="150" y1="196" x2="690" y2="196" stroke="#1b2b27" stroke-width="2"/>
+  <line x1="150" y1="196" x2="690" y2="196" stroke="url(#fade)" stroke-width="2">
+    <animate attributeName="stroke-dasharray" values="0 540;180 360;540 0" dur="3.2s" repeatCount="indefinite"/>
+  </line>
+
+  <g>
+    <rect class="box" x="60" y="172" width="180" height="48" rx="10"/>
+    <text class="mono" x="150" y="192" font-size="13" fill="#e2e8f0" text-anchor="middle">NVMe · 168 GiB</text>
+    <text class="mono" x="150" y="209" font-size="11" fill="#64748b" text-anchor="middle">288 experts / layer</text>
+  </g>
+  <g>
+    <rect class="box" x="330" y="172" width="180" height="48" rx="10"/>
+    <text class="mono" x="420" y="192" font-size="13" fill="#e2e8f0" text-anchor="middle">RAM · 10.9 GB</text>
+    <text class="mono" x="420" y="209" font-size="11" fill="#64748b" text-anchor="middle">LRU + pinned tier</text>
+  </g>
+  <g>
+    <rect class="box" x="600" y="172" width="180" height="48" rx="10"/>
+    <text class="mono" x="690" y="192" font-size="13" fill="#e2e8f0" text-anchor="middle">CPU · 24 cores</text>
+    <text class="mono" x="690" y="209" font-size="11" fill="#64748b" text-anchor="middle">int4 W4A8 matmul</text>
+  </g>
+
+  <!-- packets streaming along the pipeline -->
+  <g fill="#34d399">
+    <circle r="3.5"><animateMotion dur="3.2s" repeatCount="indefinite"><mpath xlink:href="#flow" href="#flow"/></animateMotion>
+      <animate attributeName="opacity" values="0;1;1;0" dur="3.2s" repeatCount="indefinite"/></circle>
+    <circle r="3.5"><animateMotion dur="3.2s" begin="1.05s" repeatCount="indefinite"><mpath xlink:href="#flow" href="#flow"/></animateMotion>
+      <animate attributeName="opacity" values="0;1;1;0" dur="3.2s" begin="1.05s" repeatCount="indefinite"/></circle>
+    <circle r="3.5"><animateMotion dur="3.2s" begin="2.1s" repeatCount="indefinite"><mpath xlink:href="#flow" href="#flow"/></animateMotion>
+      <animate attributeName="opacity" values="0;1;1;0" dur="3.2s" begin="2.1s" repeatCount="indefinite"/></circle>
+  </g>
+
+  <!-- measured facts -->
+  <g class="mono" font-size="12.5">
+    <rect class="chip" x="60" y="246" width="152" height="30" rx="8"/>
+    <text x="136" y="266" fill="#6ee7b7" text-anchor="middle">0.5 tok/s · CPU only</text>
+
+    <rect class="chip" x="224" y="246" width="152" height="30" rx="8"/>
+    <text x="300" y="266" fill="#6ee7b7" text-anchor="middle">k-pool 48/48 exact</text>
+
+    <rect class="chip" x="388" y="246" width="152" height="30" rx="8"/>
+    <text x="464" y="266" fill="#6ee7b7" text-anchor="middle">11 bugs found</text>
+
+    <rect class="chip" x="552" y="246" width="152" height="30" rx="8"/>
+    <text x="628" y="266" fill="#6ee7b7" text-anchor="middle">699 tests green</text>
+
+    <rect class="chip" x="716" y="246" width="124" height="30" rx="8"/>
+    <text x="778" y="266" fill="#6ee7b7" text-anchor="middle">Apache-2.0</text>
+  </g>
+</svg>
