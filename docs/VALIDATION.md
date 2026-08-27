@@ -159,6 +159,19 @@ Two independent things had to be fixed for this to hold: prefix reuse (#10) and
 the stop set (#11). The `[stop]` finish reason is part of the check -- before,
 generation ran to the length cap because no stop token was armed.
 
+A two-turn conversation was checked separately, since that is the path finding
+#10 broke and the one the web UI uses:
+
+```
+user       "My favourite colour is teal."
+assistant  "Teal is a lovely choice!"
+user       "What colour did I just say I like?"
+        -> 'You said your favourite colour is teal.'   [stop]
+```
+
+The history is genuinely consumed -- the answer is not recoverable from the last
+turn alone. This costs a full re-prefill of the transcript on every turn.
+
 ---
 
 ## What is NOT validated
@@ -180,11 +193,10 @@ generation ran to the length cap because no stop token was armed.
 * **Long context.** Nothing was run past `index_topk` on real weights.
 * **Scale.** Whole-stack tests are 4 layers at D=64. Nothing exercises expert
   streaming under cache pressure except the real run.
-* **Multi-turn conversations.** The sequence above is four independent
-  single-turn requests. A real conversation resends its history, which is the
-  exact path finding #10 broke; it now re-prefills, but nothing here tests a
-  growing transcript. Streaming responses and concurrent requests are also
-  untested (the latter refused by design).
+* **Long conversations.** One two-turn exchange is checked above. Nothing tests
+  a transcript that keeps growing, which is where the per-turn re-prefill cost
+  compounds. Streaming responses and concurrent requests are also untested (the
+  latter refused by design).
 * **Component tests cannot see request-to-request state.** Every test in the
   suite is a single forward pass. A bug that only appears on the second request
   is invisible to all eleven of them, which is how #10 survived to real weights.
