@@ -140,6 +140,69 @@ KV prefix reuse is disabled for KDA models: a recurrent state cannot be
 reconstructed from a cached prefix, only replayed by feeding the tokens in
 order. Resuming onto a state that never saw those tokens would be wrong.
 
+### 10. Prefix reuse fed the model nothing, and the safeguard was fiction
+
+The claim above -- that prefix reuse "is disabled for KDA models" -- was **false
+when written**. The guard was `putenv("KV_PREFIX=0")`, and no code in the engine
+reads a `KV_PREFIX` environment variable. It looked like a safeguard and did
+nothing. The real reuse happens in the serve submit path:
+
+```c
+int prefix=0;
+if(!echo) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+```
+
+A slot keeps the previous turn's token history. A repeated prompt matches it in
+full, so `prefix == nt`, prefill starts at `pos_base = nt`, and **zero new tokens
+are fed** -- which also means `kda_state_reset` never fires, because it is gated
+on `pos_base == 0`. The model then answers from the previous request's recurrent
+state, having never been shown the current prompt.
+
+Sound for MLA, whose KV rows are position-addressed and self-contained. Unsound
+for KDA, whose state is defined only by having been fed its tokens in order.
+
+Observed on real weights, all from this one cause:
+
+| Symptom | Mechanism |
+|---|---|
+| "I notice you sent an empty message" | literally true: zero new tokens fed |
+| "my previous responses were cut off" | the state still held them |
+| identical prompt, different answers at temperature 0 | output depends on the prior request |
+| degenerate `" 3.2.1.1.1.1"` | polluted state from an earlier request |
+
+Fixed by computing `has_kda` and skipping the prefix match entirely, so every
+request re-prefills from position 0. Cross-slot KV adoption (`COLI_KV_SHARE=1`)
+is refused for the same reason: it copies KV rows, and the recurrent state has
+no rows to copy.
+
+Cost: a full re-prefill per turn. At 0.48 tok/s that is expensive, and it is
+what the README always claimed was happening.
+
+**Why the suite missed it.** Every component test runs a single forward pass.
+Nothing exercised two requests in sequence, and this bug is invisible to any test
+that does not. A single-request serve check passed and was taken as evidence the
+serving path worked.
+
+### 11. `ARCH == "glm"` misses `glm53` -- both stop layers disarmed at once
+
+`stop_policy()` in `openai_server.py` installs GLM's role-boundary stops only
+when `ARCH == "glm"`. The new family registers as `id="glm53"`, so `StopFilter`
+was built with an **empty** sequence tuple. Meanwhile the C engine deliberately
+drops every stop but EOS in batched serve mode (#401) *on the assumption that
+Python owns the role markers*. Neither side was watching, and `<|user|>` reached
+the client as ordinary text, after which the model wrote both sides of the
+conversation.
+
+Fixed with `ARCH in ("glm", "glm53")`. This is a fifth instance of the prefix
+table below, on an arch id rather than a tensor name.
+
+Eight further sites gate on `id == "glm"` (six in `autotune.py`, two in
+`resource_plan.py`) and silently skip `glm53`. They are left alone deliberately:
+they encode GLM-5.2 KV assumptions that are wrong for a 11-of-45 KV geometry.
+The `autotune.py` ones set `RAM_GB` defaults, so the README's "auto-detect is
+conservative" note may itself be this bug rather than a property of the model.
+
+
 ---
 
 ## The prefix, four times

@@ -54,7 +54,7 @@ reference on an all-f32 container, and runs on the real 320B weights.
 
 ## Bugs found
 
-Nine, detailed in [docs/FINDINGS.md](docs/FINDINGS.md). **Three affect
+Eleven, detailed in [docs/FINDINGS.md](docs/FINDINGS.md). **Three affect
 colibri generally, not just GLM-5.3** — most seriously a resume path that
 silently overwrites already-converted output, which cost an entire layer's DSA
 indexer without erroring.
@@ -64,6 +64,14 @@ the MTP block (confirmed SIGSEGV), DSA silently disabled model-wide, and
 speculative decoding being **unsound** with KDA's non-rewindable recurrent
 state, and serve mode refusing every request because a single-row batch was
 mistaken for a ragged one.
+
+The worst of them was found last: **KV prefix reuse fed the model zero tokens.**
+A repeated prompt matched the slot's stored history in full, so prefill started
+past the whole prompt and the KDA state reset never fired -- the model answered
+from the *previous* request's state, having never seen the current one. It
+replied "I notice you sent an empty message", which was literally accurate. The
+README had claimed prefix reuse was disabled for KDA models since the first
+commit; the guard set an environment variable nothing reads. See finding #10.
 
 ---
 
@@ -196,9 +204,12 @@ supports and which should help while disk-bound.
   is per-model, not per-slot, so concurrent sequences would advance the same
   state and corrupt each other silently. Fine for single-user serving; it rules
   out multi-tenant use.
-* **KV prefix reuse is disabled** on KDA models. A recurrent state cannot be
-  restored from a cached prefix, only replayed, so multi-turn chat re-prefills
-  the whole conversation each turn — a real cost at 0.5 tok/s.
+* **KV prefix reuse is disabled** on KDA models — genuinely, as of finding #10.
+  A recurrent state cannot be restored from a cached prefix, only replayed, so
+  every turn re-prefills the whole conversation. At 0.48 tok/s that is the
+  dominant cost of multi-turn chat, and it is not optional: reuse silently
+  answers from the wrong state. Cross-slot adoption (`COLI_KV_SHARE=1`) is
+  refused for the same reason.
 * **Long context past `index_topk` (2048) is the least-tested path** on real
   weights.
 * **MTP numerics unvalidated** — the head loads and runs, its output was never

@@ -1,0 +1,12 @@
+diff --git a/c/openai_server.py b/c/openai_server.py
+--- a/c/openai_server.py
++++ b/c/openai_server.py
+@@ -1675,7 +1675,7 @@ def stop_policy(body, chat):
+     if not isinstance(ignore_leading, bool):
+         raise APIError(400, "`x_colibri_ignore_leading_stop` must be a boolean.",
+                        "x_colibri_ignore_leading_stop", "invalid_value")
+-    if chat and ARCH == "glm" and not sequences:
++    if chat and ARCH in ("glm", "glm53") and not sequences:
+         # The GLM chat template owns these role boundaries, so generic OpenAI
+         # clients should not need model-specific stop knowledge. Inkling has a
+         # different marker family and receives no implicit GLM stops. Treat an

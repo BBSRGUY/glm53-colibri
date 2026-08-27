@@ -9779,8 +9779,17 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * prompt re-prefills from position 0 -- no cached-prefix skip and no
      * cross-slot adoption below (either would leave positions with no logits). */
     int echo = sub.logprobs>0;
+    /* KDA: the recurrent state is NOT position-addressed. A cached prefix can only be
+     * replayed by feeding its tokens in order, never resumed -- so reusing one leaves the
+     * state holding the PREVIOUS request's tokens while the matched positions of the new
+     * prompt are never fed at all. Observed on real weights: identical prompts answered
+     * differently at temperature 0, replies referring to "my previous responses", and a
+     * fresh prompt reported by the model as empty (it was: prefix==nt fed zero new tokens).
+     * Forcing prefix=0 re-prefills every request from position 0, which is also what trips
+     * kda_state_reset. Costs a full re-prefill per turn; correctness is not optional. */
+    int has_kda=0; for(int i=0;i<m->c.n_layers && i<128;i++) has_kda|=m->c.is_kda[i];
     int prefix=0;
-    if(!echo) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    if(!echo && !has_kda) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
@@ -9795,7 +9804,9 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * generated tokens identical to the full-prefill run. */
     static int kvshare=-1;
     if(kvshare<0) kvshare=getenv("COLI_KV_SHARE")?atoi(getenv("COLI_KV_SHARE")):0;
-    if(kvshare && !echo && nctx>1 && prefix>=sc->len){
+    /* Cross-slot adoption copies another slot's KV rows; the KDA recurrent state has no
+     * rows to copy and would silently keep this slot's stale state. Refused with it. */
+    if(kvshare && !echo && !has_kda && nctx>1 && prefix>=sc->len){
         int best=-1, blen=sc->len;
         for(int i=0;i<nctx;i++){
             if(i==sub.slot) continue;
@@ -12091,10 +12102,9 @@ int main(int argc, char **argv){
                 "      other silently. Serve one sequence at a time.\n", slots);
               return 2;
           }
-          /* KV prefix reuse restores a cache mid-sequence; a recurrent state cannot be
-           * reconstructed that way, only replayed. Off rather than resumed onto a state
-           * that never saw those tokens. */
-          if(!getenv("KV_PREFIX")) putenv((char*)"KV_PREFIX=0");
+          /* Prefix reuse is refused at the point it is computed (see has_kda in the serve
+           * submit path), not here: no KV_PREFIX env var is read anywhere in this engine,
+           * so setting one would only look like a safeguard without being one. */
       }
       if(nk && !g_glm53_kda_spec && (g_draft>0 || m.has_mtp)){
           fprintf(stderr,

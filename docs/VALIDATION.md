@@ -127,25 +127,37 @@ Quantization error on 400 full-size expert tensors from real shard 6:
 
 ## Serve mode (OpenAI endpoint)
 
-Verified end to end on the real converted weights after the single-slot fix:
+The first version of this section verified serve mode with **one** request and
+called it working. That was wrong, and the way it was wrong is worth recording:
+a single request cannot detect a bug whose symptom is *the second* request
+answering from the first one's state. Finding #10 was live the whole time.
+
+What is checked now is a **sequence**, at `temperature=0`, where every answer is
+required to be reproducible:
 
 ```
-POST /v1/chat/completions  "In one short sentence: what is a mixture-of-experts model?"
--> "A mixture-of-experts model is a neural network architecture that routes each
-    input to a small subset of specialized sub-networks ("experts") rather than
-    using the full network, improving efficiency and capacity."
-   finish_reason: length | prompt 20, completion 40
+1  "Hello"                       -> 'Hi there! How can I help you today?'   [stop]
+2  "Hello"                       -> 'Hi there! How can I help you today?'   [stop]
+3  "What is the capital of..."   -> (correct)
+4  "Hello"                       -> 'Hi there! How can I help you today?'   [stop]
 ```
 
-A correct, instruction-following answer — not a document continuation, which is
-what the same weights produce through the direct path with a raw prompt. The
-difference is the `[gMASK]<sop><|user|>...<|assistant|>` wrapping the server
-applies.
+All three "Hello" answers are byte-identical, including #4 across an
+intervening unrelated prompt. Before the fix the same sequence produced three
+*different* answers:
 
-Component suite re-run after the fix: 11 PASS / 0 FAIL, k-pool 48/48.
+```
+1  'It looks like your message got cut off. Could you let'        [length]
+2  'It looks like your message may have been cut off. Could'      [length]
+4  'I notice my previous responses were cut off or incomplete.'   [length]
+```
 
-Not covered: concurrent requests (refused by design), multi-turn conversations,
-and streaming responses.
+Run 4 referred to "my previous responses" in a request whose entire content was
+the word "Hello".
+
+Two independent things had to be fixed for this to hold: prefix reuse (#10) and
+the stop set (#11). The `[stop]` finish reason is part of the check -- before,
+generation ran to the length cap because no stop token was armed.
 
 ---
 
@@ -168,3 +180,11 @@ and streaming responses.
 * **Long context.** Nothing was run past `index_topk` on real weights.
 * **Scale.** Whole-stack tests are 4 layers at D=64. Nothing exercises expert
   streaming under cache pressure except the real run.
+* **Multi-turn conversations.** The sequence above is four independent
+  single-turn requests. A real conversation resends its history, which is the
+  exact path finding #10 broke; it now re-prefills, but nothing here tests a
+  growing transcript. Streaming responses and concurrent requests are also
+  untested (the latter refused by design).
+* **Component tests cannot see request-to-request state.** Every test in the
+  suite is a single forward pass. A bug that only appears on the second request
+  is invisible to all eleven of them, which is how #10 survived to real weights.
