@@ -196,11 +196,40 @@ conversation.
 Fixed with `ARCH in ("glm", "glm53")`. This is a fifth instance of the prefix
 table below, on an arch id rather than a tensor name.
 
-Eight further sites gate on `id == "glm"` (six in `autotune.py`, two in
-`resource_plan.py`) and silently skip `glm53`. They are left alone deliberately:
-they encode GLM-5.2 KV assumptions that are wrong for a 11-of-45 KV geometry.
-The `autotune.py` ones set `RAM_GB` defaults, so the README's "auto-detect is
-conservative" note may itself be this bug rather than a property of the model.
+Nine further sites gated the same way and silently skipped `glm53`: six in
+`autotune.py`, two in `resource_plan.py`, one banner in `coli`. All are now fixed,
+but not by aliasing `glm53` onto the GLM-5.2 path -- one of them needed different
+logic entirely.
+
+**The planner under-counted context state by 50%.** `_glm53_geometry()` sizes the
+DSA indexer key cache *and* the k-pool gate logits, but gates both on
+`_colibri_indexer_present`, which `resource_plan.py` only ever set for `glm`. The
+flag was therefore never set for GLM-5.3 and that state was never planned:
+
+| context | planned before | actual | unaccounted |
+|---:|---:|---:|---:|
+| 2,048 | 50.3 MB | 75.5 MB | +25 MB |
+| 32,768 | 805 MB | 1,208 MB | +403 MB |
+| 131,072 | 3.22 GB | 4.83 GB | **+1.61 GB** |
+
+Simply enabling the existing probe for `glm53` would have produced `False`, for
+two reasons that are both this port's recurring themes: it looks for
+`model.layers.N...` (GLM-5.3 nests under `language_model.`), and it derives the
+required layers from `indexer_types`, which is `"full"` on all 45 layers though
+only 11 carry indexer weights -- the same misreading as finding #7. The `glm53`
+branch uses `layer_types != "linear_attention"` and the nested prefix. Verified
+against the real checkpoint index: the rule yields exactly `[3,7,...,43]`, the
+11 main-stack indexers, with layer 45 (MTP) accounted separately.
+
+`_ANALYSIS_CACHE_VERSION` was bumped 1 -> 2 with it. The cache signature is built
+from shard and config `stat()` only, so without the bump every model analysed
+before this fix would have kept the wrong flag indefinitely.
+
+Registering a family also carries build obligations the registry enforces:
+`glm53` was missing from the `install` rule, `$(LIBEXECDIR)`, CI's `ENGINES`, and
+release's artifact copy. That test had been failing since the family was first
+registered -- the C component suite was being run, colibri's Python suite was
+not. It now passes: **699 passed, 0 failed**.
 
 
 ---

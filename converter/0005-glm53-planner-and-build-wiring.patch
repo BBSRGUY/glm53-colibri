@@ -1,0 +1,196 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 2f1e5c5..9742e19 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -190,7 +190,7 @@ jobs:
+         run: |
+           cd c
+           rc=0
+-          ENGINES="colibri inkling kimi_k3 olmoe qwen36"
++          ENGINES="colibri glm53 inkling kimi_k3 olmoe qwen36"
+           if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
+           for t in $ENGINES; do
+             echo "::group::$t"
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 0c1579e..f08caf9 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -117,6 +117,7 @@ jobs:
+           # The sibling engines go in under their plain names too: `coli` resolves the
+           # engine from the model's config.json and looks for kimi_k3/inkling next to
+           # itself (c/coli, engine_for()). ~830 KB for all four.
++          cp c/glm53${{ matrix.ext }} dist/glm53${{ matrix.ext }}
+           cp c/inkling${{ matrix.ext }} dist/inkling${{ matrix.ext }}
+           cp c/kimi_k3${{ matrix.ext }} dist/kimi_k3${{ matrix.ext }}
+           cp c/olmoe${{ matrix.ext }} dist/olmoe${{ matrix.ext }}
+diff --git a/c/autotune.py b/c/autotune.py
+index 7449944..cc6f10d 100644
+--- a/c/autotune.py
++++ b/c/autotune.py
+@@ -43,7 +43,13 @@ TUNABLE_KEYS = frozenset({
+ })
+ 
+ GIB = 1024 ** 3
+-CAP_ARCHES = frozenset({"glm", "inkling", "olmoe", "qwen36"})
++CAP_ARCHES = frozenset({"glm", "glm53", "inkling", "olmoe", "qwen36"})
++# Families whose tuning behaves like GLM: experts streamed from disk, a RAM_GB
++# budget that scales with the expert cache, and deterministic output that the
++# fixed-token replay protocol can hold a candidate to. glm53 qualifies on all
++# three -- determinism only since the KDA prefix-reuse fix, without which every
++# candidate would have tripped OutputDrift.
++GLM_ARCHES = frozenset({"glm", "glm53"})
+ 
+ 
+ def _config_path(profile_dir: str | None, fingerprint: str) -> Path:
+@@ -201,7 +207,7 @@ def candidate_steps(plan: dict, base_env: dict, arch: str = "glm") -> list[tuple
+             if value != pipe:
+                 steps.append((f"cuda-pipe-{value}", {"COLI_CUDA_PIPE": str(value)}))
+         steps.append(("cuda-sync", {"COLI_CUDA_ASYNC": "0"}))
+-    if arch == "glm" and plan.get("tiers", {}).get("disk", {}).get("cold_expert_bytes", 0) > 0:
++    if arch in GLM_ARCHES and plan.get("tiers", {}).get("disk", {}).get("cold_expert_bytes", 0) > 0:
+         direct = int(base_env.get("DIRECT", "0"))
+         if direct != 1:
+             steps.append(("direct-on", {"DIRECT": "1"}))
+@@ -254,7 +260,7 @@ def resource_candidate_steps(plan: dict, base_env: dict, arch: str, cap: int,
+ 
+     if arch in CAP_ARCHES:
+         if ("cap" in explicit or cap <= 1
+-                or (arch == "glm" and "RAM_GB" in explicit)):
++                or (arch in GLM_ARCHES and "RAM_GB" in explicit)):
+             return []
+         seen = set()
+         for fraction in fractions:
+@@ -263,7 +269,7 @@ def resource_candidate_steps(plan: dict, base_env: dict, arch: str, cap: int,
+                 continue
+             seen.add(candidate_cap)
+             overlay = {}
+-            if arch == "glm" and "RAM_GB" not in explicit:
++            if arch in GLM_ARCHES and "RAM_GB" not in explicit:
+                 budget = _scaled_ram_budget(plan, fraction)
+                 if budget is not None:
+                     overlay["RAM_GB"] = f"{budget:.3f}"
+@@ -433,7 +439,7 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
+     # assumed but enforced: the first run's bytes are the contract, and any
+     # run that emits different bytes raises OutputDrift -- a drifting
+     # candidate is disqualified, a drifting baseline aborts the tune.
+-    if arch == "glm":
++    if arch in GLM_ARCHES:
+         replay, _ = create_replay(engine, cap, base_env, prompt, tokens, timeout)
+         context = tempfile.TemporaryDirectory(prefix="coli-tune-")
+     else:
+@@ -444,7 +450,7 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
+                                   for item in serving_prompts):
+         raise ValueError("tuning prompts must be non-empty strings")
+     with context as directory:
+-        if arch == "glm":
++        if arch in GLM_ARCHES:
+             ref = Path(directory) / "replay.json"
+             ref.write_text(json.dumps(replay), encoding="utf-8")
+ 
+@@ -525,7 +531,7 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
+                 recorded_cap = launch_cap if arch in CAP_ARCHES else None
+                 return _summarize_measurement(name, overlay, samples, recorded_cap)
+ 
+-        if arch == "glm":
++        if arch in GLM_ARCHES:
+             def measure(name, overlay, launch_cap):
+                 samples = []
+                 for repeat in range(repeats):
+diff --git a/c/coli b/c/coli
+index 804d609..743270f 100755
+--- a/c/coli
++++ b/c/coli
+@@ -1133,7 +1133,7 @@ def cmd_tune(a):
+     prompts=[tuning_replay_prompt(family,item) for item in raw_prompts]
+     prompt=prompts[0]
+     banner("tune · measured execution profile", model=a.model)
+-    if arch=="glm":
++    if arch in ("glm","glm53"):
+         print(f"  fixed replay: {a.tokens} tokens · {a.repeats} run(s) per candidate")
+     else:
+         active=min(a.repeats,len(prompts))
+diff --git a/c/resource_plan.py b/c/resource_plan.py
+index fe2f8da..3959dbc 100644
+--- a/c/resource_plan.py
++++ b/c/resource_plan.py
+@@ -23,7 +23,11 @@ EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\
+ # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
+ # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
+ _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
+-_ANALYSIS_CACHE_VERSION = 1
++# v2: the glm53 indexer probe was added. A cached v1 analysis carries no
++# _colibri_indexer_present for glm53 (the probe was gated on id == "glm"), and
++# the signature is built from shard/config stat only -- so without a version bump
++# every model analysed before the fix would keep the wrong flag forever.
++_ANALYSIS_CACHE_VERSION = 2
+ 
+ 
+ def _analysis_signature(shards, config_path):
+@@ -83,7 +87,7 @@ def analyze_model(model):
+             # only); the one scan-derived bit it carries for glm is the
+             # indexer-presence flag, which the cache stores alongside.
+             indexer = analysis.pop("_colibri_indexer_present", None)
+-            if indexer is not None and resolved.descriptor.id == "glm":
++            if indexer is not None and resolved.descriptor.id in ("glm", "glm53"):
+                 family_cfg = dict(resolved.family_config,
+                                   _colibri_indexer_present=indexer)
+                 resolved = type(resolved)(resolved.descriptor, resolved.model_type,
+@@ -128,21 +132,34 @@ def analyze_model(model):
+     typical_expert_bytes = int(statistics.median(per_layer.values())) if per_layer else 0
+     max_expert_bytes = max(per_layer.values(), default=0)
+     model_bytes = sum(shard.stat().st_size for shard in shards)
+-    if resolved.descriptor.id == "glm":
++    if resolved.descriptor.id in ("glm", "glm53"):
+         family_cfg = resolved.family_config
+         layers = int(family_cfg.get("num_hidden_layers") or 0)
+-        kinds = family_cfg.get("indexer_types")
+-        if isinstance(kinds, list):
+-            required = [layer for layer, kind in enumerate(kinds[:layers])
+-                        if kind == "full"]
++        if resolved.descriptor.id == "glm53":
++            # GLM-5.3 sets indexer_types "full" on all 45 layers, but only the
++            # non-KDA ones carry indexer weights -- requiring them everywhere is
++            # exactly the probe failure that disabled DSA model-wide (finding #7).
++            # layer_types is the authority, and the checkpoint nests its layers
++            # under `language_model.`. Verified against the real index: the rule
++            # yields [3,7,...,43], matching the 11 main-stack indexers exactly.
++            kinds = family_cfg.get("layer_types")
++            required = ([layer for layer, kind in enumerate(kinds[:layers])
++                         if kind != "linear_attention"]
++                        if isinstance(kinds, list) else [])
++            template = "model.language_model.layers.{}.self_attn.indexer.wq_b.weight"
+         else:
+-            frequency = max(1, int(family_cfg.get("index_topk_freq") or 1))
+-            offset = int(family_cfg.get("index_skip_topk_offset") or 2)
+-            required = [layer for layer in range(layers)
+-                        if max(layer - offset + 1, 0) % frequency == 0]
++            kinds = family_cfg.get("indexer_types")
++            if isinstance(kinds, list):
++                required = [layer for layer, kind in enumerate(kinds[:layers])
++                            if kind == "full"]
++            else:
++                frequency = max(1, int(family_cfg.get("index_topk_freq") or 1))
++                offset = int(family_cfg.get("index_skip_topk_offset") or 2)
++                required = [layer for layer in range(layers)
++                            if max(layer - offset + 1, 0) % frequency == 0]
++            template = "model.layers.{}.self_attn.indexer.wq_b.weight"
+         indexer_present = bool(required and all(
+-            f"model.layers.{layer}.self_attn.indexer.wq_b.weight" in tensor_names
+-            for layer in required))
++            template.format(layer) in tensor_names for layer in required))
+         family_cfg = dict(family_cfg, _colibri_indexer_present=indexer_present)
+         resolved = type(resolved)(resolved.descriptor, resolved.model_type,
+                                   resolved.config, family_cfg, resolved.model_dir)
+diff --git a/c/tests/test_family_registry.py b/c/tests/test_family_registry.py
+index 19caa9b..bb57e63 100644
+--- a/c/tests/test_family_registry.py
++++ b/c/tests/test_family_registry.py
+@@ -834,6 +834,8 @@ class FamilyRegistryTest(unittest.TestCase):
+         prompt = "hello {world}"
+         expected = {
+             "glm": "[gMASK]<sop><|user|>hello {world}<|assistant|><think></think>",
++            # GLM-5.3 shares GLM's chat markers: same template, different engine.
++            "glm53": "[gMASK]<sop><|user|>hello {world}<|assistant|><think></think>",
+             "inkling": "<|user|>hello {world}<|assistant|>",
+             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
+             "olmoe": "<|user|>\nhello {world}\n<|assistant|>\n",

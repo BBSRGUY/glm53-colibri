@@ -221,11 +221,15 @@ supports and which should help while disk-bound.
 
 ```
 engine/      glm53.c (forked from colibri.c), glm53_mhc.h, test, Makefile patch
-converter/   patches: classify() routing, k-pool config, --all-f32, family registry
+converter/   patches: classify() routing, k-pool config, --all-f32, family
+             registry, serve stop set, planner/autotune/build wiring
 validation/  oracles, fixtures, container/plan checkers
 scripts/     download and convert
 docs/        FINDINGS.md, VALIDATION.md
 ```
+
+All five patches apply cleanly to colibri at the pinned commit, and colibri's own
+Python suite passes with them (699 passed, 0 failed).
 
 ## License
 
