@@ -1,0 +1,184 @@
+diff --git a/c/tools/convert_fp8_to_int4.py b/c/tools/convert_fp8_to_int4.py
+index 6b9c9a1..e016dbd 100644
+--- a/c/tools/convert_fp8_to_int4.py
++++ b/c/tools/convert_fp8_to_int4.py
+@@ -190,6 +190,13 @@ _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+ # ---------- classificazione dei tensori ----------
+ def layer_idx(name):
+     p = name.split(".")
++    # GLM-5.2 is "model.layers.N.*"; GLM-5.3-Flash is multimodal and nests the text stack
++    # under "model.language_model.layers.N.*". Without this, EVERY layer tensor scores -1,
++    # which silently defeats the MTP/indexer split (li >= n_layers never fires) — the whole
++    # MTP layer would be converted into the main pass at expert bits.
++    if len(p) > 3 and p[0] == "model" and p[1] == "language_model" and p[2] == "layers":
++        try: return int(p[3])
++        except ValueError: return -1
+     if len(p) > 2 and p[0] == "model" and p[1] == "layers":
+         try: return int(p[2])
+         except ValueError: return -1
+@@ -202,9 +209,23 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
+     if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")): return "consumed"
+     li = layer_idx(name)
+     if keep_idx:
++        # --indexer-f32: carry the whole indexer at f32. The k-pool selection is a
++        # top-k over pool scores, so a quantization error of a few percent can reorder
++        # rank-adjacent pools and change which cells are visible -- unlike a matmul,
++        # where the same error just perturbs the output slightly.
++        if (INDEXER_F32 or ALL_F32) and li >= 0 and li <= n_layers and "indexer" in name:
++            return "f32"
+         # modalita' --indexer: SOLO i pesi del DSA lightning indexer dei layer principali
+-        if li < 0 or li >= n_layers or "indexer" not in name: return "skip"
+-        if name.endswith("norm.weight"): return "f32"
++        # GLM-5.3 sets index_share_for_mtp_iteration=true, so the MTP block (li == n_layers)
++        # carries its own indexer. It is skipped by the --mtp pass ("indexer" in name) and
++        # was skipped here too (li >= n_layers), leaving those 7 tensors claimed by NO pass
++        # and silently absent from the container. Accept li == n_layers as well.
++        if li < 0 or li > n_layers or "indexer" not in name: return "skip"
++        if name.endswith(("norm.weight", "norm.bias")): return "f32"
++        # index_kpool_compress_ape is a [kpool, index_head_dim] absolute-position table
++        # (512 elements). Quantizing a positional table buys nothing and costs precision
++        # exactly where the k-pool decides which keys survive; keep it f32.
++        if name.endswith("index_kpool_compress_ape"): return "f32"
+         return "q"                                       # int8 consigliato (--ebits 8): pesi di scoring
+     if keep_mtp:
+         if li != n_layers: return "skip"                 # solo il layer MTP
+@@ -213,10 +234,25 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
+         if li >= n_layers: return "skip"                 # layer MTP (78)
+         if any(k in name for k in ["indexer", "indexers_proj", "eh_proj",
+                                     "enorm", "hnorm", "shared_head"]): return "skip"
++    # GLM-5.3 vision tower (glm5_next_vision): a dense 24-block ViT, 563.6M params, already
++    # BF16 in the checkpoint (no weight_scale_inv anywhere under visual.). It runs once per
++    # IMAGE at prefill, never per decoded token, so it contributes nothing to the streaming
++    # bottleneck and there is no reason to push it below int8 (--vis-bits). patch_embed.proj
++    # is 5-D and downsample is 4-D; convert_shard keeps any non-2-D tensor f32 automatically.
++    # GLM-5.2 has no visual.* tensors, so this rule is inert there.
++    if ".visual." in name or name.startswith("visual."):
++        if name.endswith(".weight") and not name.endswith("norm.weight"): return "vis"
++        return "f32"
++    # --all-f32: everything this pass keeps, unquantized. Placed AFTER the skip logic so
++    # it never widens which tensors a pass emits (doing so duplicated names across shards).
++    if ALL_F32: return "f32"
+     if name.endswith("e_score_correction_bias"): return "f32"
+     if name.endswith("mlp.gate.weight"): return "f32"    # router (NON gate_proj)
+-    if name.endswith("norm.weight") or name == "model.norm.weight": return "f32"
++    if name.endswith("norm.weight") or name.endswith("model.norm.weight"): return "f32"
++    # GLM-5.3 nests embeddings as "model.language_model.embed_tokens.weight"; without the
++    # suffix match it falls through to the generic "q" branch and gets expert bits.
+     if name in ("model.embed_tokens.weight", "lm_head.weight"): return "io"
++    if name.endswith("model.embed_tokens.weight"): return "io"
+     if ".mlp.experts." in name and name.endswith(".weight"): return "x"  # expert ROUTED (streaming)
+     # Split resident weights by type for mixed-precision control:
+     #   "sh" = shared expert (fires on every token, highest sensitivity)
+@@ -229,6 +265,22 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
+     if name.endswith("kv_b_proj.weight"): return "kvb"
+     if any(name.endswith(k) for k in ("q_a_proj.weight", "q_b_proj.weight",
+                                        "kv_a_proj_with_mqa.weight")): return "attn"
++    #   "kda" = GLM-5.3 linear-attention (KDA) projections on the 34 non-DSA layers.
++    # Deliberately checked AFTER the MLA suffixes above: "kv_b_proj.weight" and
++    # "q_b_proj.weight" must land on kvb/attn, never here. Suffixes are anchored on
++    # "self_attn." where the bare name would otherwise be ambiguous. The conv1d taps are
++    # 3-D and A_log/dt_bias are 1-D, so those stay f32 via the ndim!=2 path in convert_shard.
++    #   GLM-5.3 KDA side projections stay F32. kda_forward() reads these with the f32
++    # loader (as kimi_k3.c does), so quantizing them makes the engine refuse the tensor
++    # outright: "is U8/I8 -- not a float tensor". They are also the sensitive ones --
++    # decay and gate LoRA factors feeding exp()/sigmoid() -- and small: ~112M params
++    # across all 34 KDA layers, 450 MB f32 vs 112 MB int8.
++    if any(name.endswith(k) for k in ("self_attn.b_proj.weight",
++                                       "g_a_proj.weight", "g_b_proj.weight",
++                                       "f_a_proj.weight", "f_b_proj.weight")): return "f32"
++    #   "kda" = the large KDA projections, which kda_forward() runs through matmul_qt.
++    if any(name.endswith(k) for k in ("self_attn.q_proj.weight", "self_attn.k_proj.weight",
++                                       "self_attn.v_proj.weight")): return "kda"
+     if any(name.endswith(k) for k in ("mlp.gate_proj.weight", "mlp.up_proj.weight",
+                                        "mlp.down_proj.weight")): return "dmlp"
+     if name.endswith(".weight"): return "q"              # fallback: other resident weights
+@@ -303,6 +355,12 @@ def dequant(f, name, keys):
+ # record dict(PROJ_BITS) — this global is the definition those sites depend on.
+ PROJ_BITS = {}
+ 
++# --indexer-f32: keep DSA indexer tensors unquantized (set in main()).
++INDEXER_F32 = False
++
++# --all-f32: carry EVERY 2-D weight unquantized, for isolating quantization drift.
++ALL_F32 = False
++
+ # Rows per quantization block. Every non-E8 format here carries per-row scales (or
+ # per-group scales along I), so rows never interact and blocking is BIT-IDENTICAL to
+ # quantizing the whole tensor — it only caps the peak of the quantizer's full-size
+@@ -349,7 +407,7 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
+                 else:
+                     bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
+                 # Any unknown kind that fell through classify as "q"
+-                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
++                if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp", "kda", "vis"):
+                     bits = ebits
+                 # Per-projection override for routed experts, applied on top of the type-level bits.
+                 if kind == "x" and PROJ_BITS:          # e.g. up_proj -> 3 (int3-g64) while gate/down stay 4
+@@ -464,6 +522,13 @@ def main():
+         help="bits for kv_b_proj (reconstructs KV cache on every decode). Default=ebits")
+     ap.add_argument("--attn-bits", type=int, default=None,
+         help="bits for other attention projections (q_a, q_b, kv_a). Default=ebits")
++    ap.add_argument("--kda-bits", type=int, default=None,
++                    help="GLM-5.3: bits for KDA linear-attention projections (34 layers). "
++                         "These are native BF16 in the checkpoint (never FP8), so they carry "
++                         "no upstream quantization damage; int8 recommended.")
++    ap.add_argument("--vis-bits", type=int, default=None,
++                    help="GLM-5.3: bits for the vision tower (563.6M params, native BF16). "
++                         "Runs once per image, not per token; int8 recommended (0.56 GB).")
+     ap.add_argument("--dmlp-bits", type=int, default=None,
+         help="bits for dense MLP (first 3 layers). Default=ebits")
+     ap.add_argument("--group-size", type=int, default=64,
+@@ -501,6 +566,12 @@ def main():
+         help="unit-test del dequant NVFP4 (LUT e2m1 + round-trip), nessun download / no network")
+     ap.add_argument("--mtp", action="store_true",
+         help="download and convert ONLY the MTP head (model.layers.<n_layers>.*) -> out-mtp-*.safetensors")
++    ap.add_argument("--all-f32", action="store_true",
++                    help="carry every weight at f32 (huge; for isolating quantization drift)")
++    ap.add_argument("--indexer-f32", action="store_true",
++                    help="carry the DSA indexer at f32 (no quantization). The k-pool "
++                         "selection is a top-k over pool scores, so quantization can "
++                         "reorder rank-adjacent pools and change the visible cell set.")
+     ap.add_argument("--indexer", action="store_true",
+         help="extract ONLY the DSA lightning-indexer weights -> out-idx-*.safetensors. WARNING: "
+              "indexer tensors are spread across nearly every shard, so this re-downloads the whole "
+@@ -539,12 +610,20 @@ def main():
+ 
+     # Build per-type bits map. If a type-specific arg is set, use it; otherwise the
+     # converter falls back to ebits for that type.
++    global INDEXER_F32, ALL_F32
++    INDEXER_F32 = bool(getattr(a, "indexer_f32", False))
++    ALL_F32 = bool(getattr(a, "all_f32", False))
++    if ALL_F32: print("[F32] carrying ALL weights unquantized")
++    if INDEXER_F32:
++        print("[INDEXER] carrying indexer tensors at f32 (unquantized)")
+     bits_map = {}
+     if a.shared_bits is not None: bits_map["sh"] = a.shared_bits
+     if a.o_bits is not None:      bits_map["o"] = a.o_bits
+     if a.kvb_bits is not None:    bits_map["kvb"] = a.kvb_bits
+     if a.attn_bits is not None:   bits_map["attn"] = a.attn_bits
+     if a.dmlp_bits is not None:   bits_map["dmlp"] = a.dmlp_bits
++    if a.kda_bits is not None:    bits_map["kda"] = a.kda_bits
++    if a.vis_bits is not None:    bits_map["vis"] = a.vis_bits
+     if bits_map:
+         print(f"[MIXED] precision map: " + ", ".join(f"{k}={v}bit" for k,v in sorted(bits_map.items())))
+ 
+@@ -651,9 +730,17 @@ def main():
+             if os.path.exists(idxp):
+                 wmap = json.load(open(idxp))["weight_map"]
+                 if a.mtp:
+-                    want = {v for k, v in wmap.items() if k.startswith(f"model.layers.{a.n_layers}.")}
++                    # layer_idx() rather than a literal "model.layers.N." prefix: GLM-5.3
++                    # nests the stack as model.language_model.layers.N, so the literal form
++                    # selects ZERO shards and the MTP block is silently left out of the
++                    # container. The indexer branch below already goes through layer_idx.
++                    want = {v for k, v in wmap.items() if layer_idx(k) == a.n_layers}
+                 else:
+-                    want = {v for k, v in wmap.items() if "indexer" in k and 0 <= layer_idx(k) < a.n_layers}
++                    # <= n_layers, matching classify()'s keep_idx branch: GLM-5.3 sets
++                    # index_share_for_mtp_iteration, so the MTP block carries its own
++                    # indexer. A strict < here selects every shard except the one holding
++                    # it, and those 7 tensors end up in no pass at all.
++                    want = {v for k, v in wmap.items() if "indexer" in k and 0 <= layer_idx(k) <= a.n_layers}
+                 keep = [sp for sp in shards if os.path.basename(sp) in want]
+                 print(f"[PLAN] index: {len(keep)}/{len(shards)} local shard(s) hold the requested tensors")
+                 shards = keep

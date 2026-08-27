@@ -1,0 +1,98 @@
+diff --git a/c/family_registry.py b/c/family_registry.py
+index ca9d3a1..bfe7f3b 100644
+--- a/c/family_registry.py
++++ b/c/family_registry.py
+@@ -126,6 +126,48 @@ def _glm_geometry(config, context, _model_dir):
+     return PlannerGeometry(state, 0, workspace, experts)
+ 
+ 
++def _glm53_geometry(config, context, _model_dir):
++    """GLM-5.3-Flash: hybrid KDA/DSA attention with mHC residual streams."""
++    layers = _required_int(config, "num_hidden_layers", "glm53")
++    experts = _required_int(config, "n_routed_experts", "glm53")
++    kv_lora = _required_int(config, "kv_lora_rank", "glm53")
++    rope = _optional_int(config, "qk_rope_head_dim", 0)          # 0 under mla_use_nope
++    heads = _required_int(config, "num_attention_heads", "glm53")
++    nope = _required_int(config, "qk_nope_head_dim", "glm53")
++    value = _required_int(config, "v_head_dim", "glm53")
++    hc = max(1, _optional_int(config, "hc_mult", 1))
++
++    kinds = config.get("layer_types")
++    if isinstance(kinds, list) and kinds:
++        full = sum(kind != "linear_attention" for kind in kinds[:layers])
++        linear = sum(kind == "linear_attention" for kind in kinds[:layers])
++    else:                                                        # no layer_types: assume all full
++        full, linear = layers, 0
++    full += 1                                                    # the MTP block keeps its own KV
++
++    # per-token, per-full-layer latent row
++    state = full * context * (kv_lora + rope) * 4
++
++    # DSA indexer key cache, on the full layers that carry one
++    index_dim = _optional_int(config, "index_head_dim", 0)
++    if index_dim and config.get("_colibri_indexer_present", False):
++        state += full * context * index_dim * 4
++        if _optional_int(config, "index_kpool", 0) > 1:
++            state += full * context * index_dim * 4              # k-pool also caches gate logits
++
++    # KDA recurrent state + conv windows: constant in context
++    fixed = 0
++    la = config.get("linear_attn_config") or {}
++    if linear and isinstance(la, dict):
++        kh = _optional_int(la, "num_heads", 0)
++        khd = _optional_int(la, "head_dim", 0)
++        conv = _optional_int(la, "short_conv_kernel_size", 0)
++        fixed = linear * (kh * khd * khd + 3 * kh * khd * conv) * 4
++
++    workspace = hc * context * heads * (nope + value) * 4
++    return PlannerGeometry(state, fixed, workspace, experts)
++
++
+ def _qwen36_geometry(config, context, _model_dir):
+     """Hybrid: only the full_attention layers hold a KV cache; the linear
+     (DeltaNet) layers carry a recurrent state whose size does not depend on the
+@@ -396,6 +438,12 @@ def _dsv4_geometry(config, context, _model_dir):
+ _GLM_EXPERT = re.compile(
+     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
+ )
++# GLM-5.3 nests the text stack: model.language_model.layers.N.mlp.experts.M.
++# _GLM_EXPERT's "model.layers." never matches there, so every expert reads as dense
++# weight and the planner sizes the whole 188 GB as resident.
++_GLM53_EXPERT = re.compile(
++    r"(?:^|\.)model\.(?:language_model\.)?layers\.(\d+)\.mlp\.experts\.(\d+)\."
++)
+ _KIMI_EXPERT = re.compile(
+     r"^(?:language_model\.)?model\.layers\.(\d+)\.block_sparse_moe\."
+     r"experts\.(\d+)\."
+@@ -457,6 +505,31 @@ FAMILIES = (
+         has_cli_adapter=True,
+         tune_prompt_template="[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>",
+     ),
++    FamilyDescriptor(
++        id="glm53",
++        model_types=("glm5_next", "glm5_next_text"),
++        display_name="GLM-5.3-Flash",
++        display_scale="320B",
++        engine_artifact="glm53",
++        engine_aliases=("glm53", "glm5next"),
++        engine_group="colibri-core",
++        internal_arch="glm53",
++        build_target="glm53",
++        process_names=("glm53", "glm5next"),
++        default_model_id="glm-5.3-flash-colibri",
++        cli_adapter="glm",
++        gateway_adapter="glm",
++        planner_id="glm53_hybrid",
++        planner_geometry=_glm53_geometry,
++        planner_unsupported_reason="",
++        expert_inventory=_individual_expert_inventory(_GLM53_EXPERT),
++        config_section="text_config",
++        limits=FamilyLimits(4096, 1048576, 1024, 16384, 16, 0, "CTX"),
++        capabilities=FamilyCapabilities(True, True, False, True),
++        has_gateway_adapter=True,
++        has_cli_adapter=True,
++        tune_prompt_template="[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>",
++    ),
+     FamilyDescriptor(
+         id="inkling",
+         model_types=("inkling_mm_model", "inkling"),

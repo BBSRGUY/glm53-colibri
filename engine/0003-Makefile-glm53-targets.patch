@@ -1,0 +1,51 @@
+diff --git a/c/Makefile b/c/Makefile
+index 798ce38..fe2e41e 100644
+--- a/c/Makefile
++++ b/c/Makefile
+@@ -699,6 +699,46 @@ $(file >.build-config,$(BUILD_CONFIG))
+ endif
+ .build-config: ;
+ 
++# GLM-5.3 component validation. Both oracles are third-party: the mHC fixture is
++# produced by transformers' own DeepseekV4HyperConnection, and the KDA fixture by
++# colibri's numpy KDA reference (tools/k3_ref.py) with GLM-5.3's low-rank gate.
++# Regenerating the fixtures needs python + torch; the checked-in ones do not.
++GLM53_FIXTURES ?= ../../work
++.PHONY: test-glm53 glm53-fixtures
++glm53-fixtures:
++	python3 $(GLM53_FIXTURES)/mhc_oracle.py $(GLM53_FIXTURES)/mhc_fixture.bin
++	python3 $(GLM53_FIXTURES)/kda_oracle.py $(GLM53_FIXTURES)/kda_fixture.bin
++	python3 $(GLM53_FIXTURES)/layer_oracle.py $(GLM53_FIXTURES)/layer_fixture.bin
++	SLIM=0.3 python3 $(GLM53_FIXTURES)/layer_oracle.py $(GLM53_FIXTURES)/layer_clamp.bin
++	python3 $(GLM53_FIXTURES)/moe_oracle.py $(GLM53_FIXTURES)/moe_fixture.bin
++	SLIM=0.25 python3 $(GLM53_FIXTURES)/moe_oracle.py $(GLM53_FIXTURES)/moe_clamp.bin
++	T=5 python3 $(GLM53_FIXTURES)/mla_oracle.py $(GLM53_FIXTURES)/mla_t5.bin
++	T=8 python3 $(GLM53_FIXTURES)/mla_oracle.py $(GLM53_FIXTURES)/mla_t8.bin
++	python3 $(GLM53_FIXTURES)/moe_q_oracle.py $(GLM53_FIXTURES)/moeq_fixture.bin
++
++test_glm53_mhc$(EXE): tests/test_glm53_mhc.c glm53_mhc.h dsv4_mhc.h
++	$(CC) -O2 -Wall -Wextra tests/test_glm53_mhc.c -o test_glm53_mhc$(EXE) -lm
++
++test-glm53: test_glm53_mhc$(EXE) glm53$(EXE)
++	./test_glm53_mhc$(EXE) $(GLM53_FIXTURES)/mhc_fixture.bin
++	GLM53_KDA_SELFTEST=$(GLM53_FIXTURES)/kda_fixture.bin ./glm53$(EXE)
++	GLM53_LAYER_SELFTEST=$(GLM53_FIXTURES)/layer_fixture.bin ./glm53$(EXE)
++	GLM53_LAYER_SELFTEST=$(GLM53_FIXTURES)/layer_clamp.bin ./glm53$(EXE)
++	GLM53_MOE_SELFTEST=$(GLM53_FIXTURES)/moe_fixture.bin ./glm53$(EXE)
++	GLM53_MOE_SELFTEST=$(GLM53_FIXTURES)/moe_clamp.bin ./glm53$(EXE)
++	GLM53_MLA_SELFTEST=$(GLM53_FIXTURES)/mla_t5.bin ./glm53$(EXE)
++	ABSORB=0 GLM53_MLA_SELFTEST=$(GLM53_FIXTURES)/mla_t8.bin ./glm53$(EXE)
++	ABSORB=1 GLM53_MLA_SELFTEST=$(GLM53_FIXTURES)/mla_t8.bin ./glm53$(EXE)
++	IDOT=0 GLM53_MOEQ_SELFTEST=$(GLM53_FIXTURES)/moeq_fixture.bin ./glm53$(EXE)
++	IDOT=1 GLM53_MOEQ_SELFTEST=$(GLM53_FIXTURES)/moeq_fixture.bin ./glm53$(EXE)
++
++# GLM-5.3-Flash (glm5_next): colibri.c forked, plus KDA linear attention and the
++# DeepSeek-V4 mHC header. Same single-TU build as every other engine here.
++.PHONY: glm53
++glm53: glm53$(EXE)
++glm53$(EXE): glm53.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h dsv4_mhc.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
++	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
++
+ colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h kv_fp8.h kv_tq.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+ 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
+ 

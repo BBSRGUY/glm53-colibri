@@ -1,0 +1,70 @@
+glm53-colibri
+=============
+
+This work is a derivative of colibri (https://github.com/JustVugg/colibri),
+licensed under the Apache License, Version 2.0. A copy of that license is in
+LICENSE. This NOTICE states the changes, as Section 4(b) requires.
+
+Forked at upstream commit dd7df2c907494f0b9812a8bf972d56079f11791e.
+
+
+WHAT IS DERIVED, AND FROM WHAT
+------------------------------
+
+engine/glm53.c
+    A fork of colibri.c (the GLM-5.2 / glm_moe_dsa engine). The great majority
+    of this file is upstream code: expert streaming, the LRU/pin tiers, the
+    sigmoid + noaux_tc router, MLA attention, the MTP head, quantization
+    kernels, the serve loop. See the file header for what was added.
+
+    Within it, two blocks are ports rather than original work:
+
+      kda_forward()   ported from colibri's own c/kimi_k3.c:1167 (Kimi Delta
+                      Attention). Every tensor name and shape matched already;
+                      the only change is GLM-5.3's low-rank output gate
+                      (g_a_proj @ g_b_proj) replacing Kimi's dense g_proj.
+
+      mHC             dsv4_mhc.h is included VERBATIM from colibri's
+                      DeepSeek-V4 engine. GLM-5.3's hyper-connections are
+                      DeepSeek-V4's unchanged -- llama.cpp reached the same
+                      conclusion independently, subclassing
+                      DeepseekV4HyperConnection with a bare `pass`.
+
+engine/glm53_mhc.h
+    New. Thin glue over dsv4_mhc.h pinning the three constants GLM-5.3 needs
+    (post scale 2.0, both epsilons = hc_eps) plus the stream seed/collapse.
+
+converter/*.patch, engine/0003-Makefile-glm53-targets.patch
+    Patches against the upstream files named in each patch header.
+
+
+WHAT IS ORIGINAL
+----------------
+
+  * The DSA k-pool indexer implementation in glm53.c. Written from the
+    algorithm described in llama.cpp PR #27752 (ggml-org/llama.cpp), which is
+    unmerged, text-only, and whose author states it is "not numerically
+    validated" and was "never tested on real weights". No code was copied from
+    it; the pooled-key formulation is the paper's, the C implementation is not.
+  * The hybrid KDA/DSA layer dispatch and the [S, hc_mult, D] residual plumbing.
+  * The validation harness in validation/ and the fixtures beside it.
+  * The GLM-5.3 family descriptor and planner geometry in family_registry.py.
+
+
+THIRD-PARTY REFERENCES USED AS ORACLES (not vendored)
+-----------------------------------------------------
+
+  * transformers' DeepseekV4HyperConnection -- oracle for mHC.
+  * transformers' GlmMoeDsaAttention -- oracle for MLA.
+  * colibri's c/tools/k3_ref.py -- basis for the KDA numpy reference.
+
+  These are imported at test time from an installed transformers / from the
+  upstream colibri checkout. No third-party source is redistributed here.
+
+
+MODEL WEIGHTS
+-------------
+
+No weights are distributed in this repository. GLM-5.3-Flash is published by
+Z.AI at https://huggingface.co/zai-org/GLM-5.3-Flash under the MIT License.
+scripts/download_glm53.py fetches it; scripts/convert_glm53.sh converts it.
