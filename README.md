@@ -8,6 +8,7 @@ which supports GLM-5.2 but not GLM-5.3. It is a **fork with additions**, not a
 new engine — see [NOTICE](NOTICE) for exactly what is derived and from what.
 
 Measured on the machine below: **0.48 tok/s**, 13.3 GB RSS, 168 GiB on disk.
+Serves an OpenAI-compatible endpoint for single-user use.
 
 > **Status: working, incompletely validated.** It generates coherent text on
 > real weights and every component is checked against an oracle, but no
@@ -53,7 +54,7 @@ reference on an all-f32 container, and runs on the real 320B weights.
 
 ## Bugs found
 
-Eight, detailed in [docs/FINDINGS.md](docs/FINDINGS.md). **Three affect
+Nine, detailed in [docs/FINDINGS.md](docs/FINDINGS.md). **Three affect
 colibri generally, not just GLM-5.3** — most seriously a resume path that
 silently overwrites already-converted output, which cost an entire layer's DSA
 indexer without erroring.
@@ -61,7 +62,8 @@ indexer without erroring.
 Also: unclamped SwiGLU in three places, a NULL-deref plus 4x heap overflow on
 the MTP block (confirmed SIGSEGV), DSA silently disabled model-wide, and
 speculative decoding being **unsound** with KDA's non-rewindable recurrent
-state.
+state, and serve mode refusing every request because a single-row batch was
+mistaken for a ragged one.
 
 ---
 
@@ -97,13 +99,28 @@ bash   scripts/convert_glm53.sh             # -> glm53-int4/, ~168 GiB
 python validation/verify_container.py glm53-int4    # pre-flight; run this
 ```
 
-Chat:
+Serve an OpenAI-compatible endpoint:
 
 ```bash
-python coli chat --model /path/to/glm53-int4 --ram 17 --ctx 2048 --cap 6
+python coli serve --model /path/to/glm53-int4 --ram 17 --ctx 2048 --port 8111
 ```
 
-`--ram` matters: auto-detect is conservative and drops the expert cache hard.
+Then point any OpenAI client at `http://127.0.0.1:8111/v1`. Verified reply to
+*"In one short sentence: what is a mixture-of-experts model?"*:
+
+> A mixture-of-experts model is a neural network architecture that routes each
+> input to a small subset of specialized sub-networks ("experts") rather than
+> using the full network, improving efficiency and capacity.
+
+`coli chat` works too. `--ram` matters: auto-detect is conservative and drops
+the expert cache hard.
+
+The engine can also be driven directly, but that path takes a **raw prompt with
+no chat template**, so the model continues your text instead of answering it:
+
+```bash
+PROMPT="..." NGEN=48 COLI_TEMP=0 RAM_GB=17 CTX=2048 SNAP=/path/to/glm53-int4 ./glm53.exe 9
+```
 
 ---
 
@@ -175,6 +192,13 @@ supports and which should help while disk-bound.
   embedding, which is why the checkpoint has no positional tensor). Because a
   ViT is dense, cheap, runs once per image and fits in 12 GB VRAM, the cheapest
   path is a PyTorch sidecar producing 256 embeddings spliced at `<|image|>`.
+* **One sequence at a time.** `KV_SLOTS>1` is refused: the KDA recurrent state
+  is per-model, not per-slot, so concurrent sequences would advance the same
+  state and corrupt each other silently. Fine for single-user serving; it rules
+  out multi-tenant use.
+* **KV prefix reuse is disabled** on KDA models. A recurrent state cannot be
+  restored from a cached prefix, only replayed, so multi-turn chat re-prefills
+  the whole conversation each turn — a real cost at 0.5 tok/s.
 * **Long context past `index_topk` (2048) is the least-tested path** on real
   weights.
 * **MTP numerics unvalidated** — the head loads and runs, its output was never

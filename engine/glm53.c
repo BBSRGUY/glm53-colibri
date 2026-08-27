@@ -7413,7 +7413,16 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
                           coll+(int64_t)sx*D);
         for(int sx=0;sx<S;sx++) rmsnorm(nrm+(int64_t)sx*D, coll+(int64_t)sx*D, l->in_ln, D, c->eps);
         if(c->is_kda[li]){
-            if(kvs||positions){ fprintf(stderr,"KDA layer %d: ragged per-row KV/positions unsupported\n",li); exit(1); }
+        /* A one-row "batch" is not ragged: one sequence at one position, which is exactly
+         * what the recurrent state expects. run_serve_mux routes even a lone active slot
+         * through step_decode_batch, so refusing all kvs/positions blocked serve mode
+         * outright. S > 1 with per-row states IS unrepresentable -- one recurrent state
+         * cannot advance to several positions at once -- and KV_SLOTS > 1 is refused at
+         * startup for that reason. */
+            if((kvs || positions) && S != 1){
+                fprintf(stderr,"KDA layer %d: ragged multi-row KV/positions unsupported (S=%d); run with KV_SLOTS=1\n",li,S);
+                exit(1);
+            }
             kda_forward(m,l,li,nrm,S,tmp);
         } else attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
         /* out-of-place: mhc_post reads every stream of the row while writing them all */
@@ -7443,10 +7452,16 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
      * COLI_GLM53_TODO: the ragged-mux path (kvs != NULL, per-row positions) has no KDA
      * equivalent yet; refuse rather than silently score rows against the wrong state. */
     if(c->is_kda[li]){
-        if(kvs || positions){
-            fprintf(stderr,"KDA layer %d: ragged per-row KV/positions are not supported\n",li);
-            exit(1);
-        }
+        /* A one-row "batch" is not ragged: one sequence at one position, which is exactly
+         * what the recurrent state expects. run_serve_mux routes even a lone active slot
+         * through step_decode_batch, so refusing all kvs/positions blocked serve mode
+         * outright. S > 1 with per-row states IS unrepresentable -- one recurrent state
+         * cannot advance to several positions at once -- and KV_SLOTS > 1 is refused at
+         * startup for that reason. */
+            if((kvs || positions) && S != 1){
+                fprintf(stderr,"KDA layer %d: ragged multi-row KV/positions unsupported (S=%d); run with KV_SLOTS=1\n",li,S);
+                exit(1);
+            }
         kda_forward(m,l,li,nrm,S,tmp);
     } else {
         attention_rows(m,l,li,nrm,S,pos_base,kvs,positions,tmp);
@@ -7949,6 +7964,10 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
      * no model-level hyper-connection tensors at all, and llama.cpp's glm5next graph
      * uses glm5next_hc_mean (sum / hc). The absent tensors corroborate the mean.
      * The buffer lives only here, so callers keep their [S,D] contract. */
+    /* A forward starting at position 0 is a fresh sequence, so the previous one's KDA
+     * recurrent state and conv windows must not carry over. Nothing else resets them:
+     * they are per-model, and only the token order that produced them defines them. */
+    if(pos_base == 0 && !positions) kda_state_reset(m);
     /* Main stack only. The MTP head calls layer_forward() directly with a [S,D] buffer
      * and is never seeded/collapsed here -- correct, since it has no hc_* tensors. */
     int hcM = c->hc_mult;
@@ -12063,6 +12082,20 @@ int main(int argc, char **argv){
     /* KDA carries a recurrent state that a rejected draft cannot be rolled back out of,
      * so speculation would silently corrupt every later token. Refuse it. */
     { int nk=0; for(int i=0;i<m.c.n_layers && i<128;i++) nk+=m.c.is_kda[i];
+      if(nk){
+          int slots = getenv("KV_SLOTS") ? atoi(getenv("KV_SLOTS")) : 1;
+          if(slots > 1){
+              fprintf(stderr,
+                "[KDA] KV_SLOTS=%d refused: the recurrent state is per-MODEL, not per-slot,\n"
+                "      so concurrent sequences would advance the same state and corrupt each\n"
+                "      other silently. Serve one sequence at a time.\n", slots);
+              return 2;
+          }
+          /* KV prefix reuse restores a cache mid-sequence; a recurrent state cannot be
+           * reconstructed that way, only replayed. Off rather than resumed onto a state
+           * that never saw those tokens. */
+          if(!getenv("KV_PREFIX")) putenv((char*)"KV_PREFIX=0");
+      }
       if(nk && !g_glm53_kda_spec && (g_draft>0 || m.has_mtp)){
           fprintf(stderr,
             "[SPEC] disabled: %d KDA layers carry a recurrent state that cannot be rewound\n"

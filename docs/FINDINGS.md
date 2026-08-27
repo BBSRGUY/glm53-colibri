@@ -117,6 +117,29 @@ f_a_proj.weight: tensor is U8/I8 -- not a float tensor
 Fixed by splitting the class: `q/k/v` stay quantized (3.4B params), while
 `f_a`/`f_b`/`g_a`/`g_b`/`b_proj` stay f32. Costs ~345 MB of resident RAM.
 
+### 9. Serve mode: ragged batches, and a state that is per-model
+
+`run_serve_mux` routes **every** decode through `step_decode_batch`, which passes
+per-row `kvs[]`/`positions[]` — even when only one slot is active. The KDA
+dispatch refused any such call, so `coli serve` / `coli chat` died on the first
+request with `engine_error`, while the direct path worked fine.
+
+The refusal was too broad. A one-row batch is not ragged: one sequence, one
+position, advancing the recurrent state by one token, which is exactly a
+contiguous decode. Now gated on `S != 1`.
+
+Two related hazards surfaced with it, both silent rather than loud:
+
+* KDA state is per-**model** (`m->kstate[layer]`), not per-slot, so two
+  concurrent sequences would advance the same state and corrupt each other with
+  no error. `KV_SLOTS > 1` is now refused at startup.
+* Nothing reset the state between requests, so each conversation inherited the
+  previous one's. Reset now happens on a forward starting at position 0.
+
+KV prefix reuse is disabled for KDA models: a recurrent state cannot be
+reconstructed from a cached prefix, only replayed by feeding the tokens in
+order. Resuming onto a state that never saw those tokens would be wrong.
+
 ---
 
 ## The prefix, four times

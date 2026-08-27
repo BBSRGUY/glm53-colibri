@@ -125,6 +125,30 @@ Quantization error on 400 full-size expert tensors from real shard 6:
 
 ---
 
+## Serve mode (OpenAI endpoint)
+
+Verified end to end on the real converted weights after the single-slot fix:
+
+```
+POST /v1/chat/completions  "In one short sentence: what is a mixture-of-experts model?"
+-> "A mixture-of-experts model is a neural network architecture that routes each
+    input to a small subset of specialized sub-networks ("experts") rather than
+    using the full network, improving efficiency and capacity."
+   finish_reason: length | prompt 20, completion 40
+```
+
+A correct, instruction-following answer — not a document continuation, which is
+what the same weights produce through the direct path with a raw prompt. The
+difference is the `[gMASK]<sop><|user|>...<|assistant|>` wrapping the server
+applies.
+
+Component suite re-run after the fix: 11 PASS / 0 FAIL, k-pool 48/48.
+
+Not covered: concurrent requests (refused by design), multi-turn conversations,
+and streaming responses.
+
+---
+
 ## What is NOT validated
 
 * **No end-to-end reference exists.** `Glm5NextForConditionalGeneration` is not
