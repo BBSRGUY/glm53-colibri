@@ -71,6 +71,14 @@ def video_frames():
     return max(2, n - (n % 2))
 
 
+def video_steps():
+    """Temporal positions per clip = frames / temporal_patch_size. Each gets its own
+    readable "Frame k:" label in the prompt."""
+    cfg = _STATE["cfg"]
+    tp = cfg["temporal_patch_size"] if cfg else 2
+    return video_frames() // tp
+
+
 def tokens_per_video(ckpt):
     per = tokens_per_image(ckpt)
     return (video_frames() // _STATE["cfg"]["temporal_patch_size"]) * per

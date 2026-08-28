@@ -8083,12 +8083,19 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
  * file stays valid across a chunked prefill. */
 static float *g_img_emb=NULL;
 static int    g_img_pos0=-1, g_img_n=0;
+/* pos -> row index, or -1. A map rather than an offset from g_img_pos0 because the
+ * placeholder run need not be contiguous: video interleaves readable "Frame k:"
+ * labels between the per-frame blocks, which is the only temporal index GLM-5.3
+ * gets (the tower is 2D-positional and the text stack is NoPE). */
+static int   *g_img_map=NULL;
+static int    g_img_maplen=0;
 
 /* Serving reloads per request: the sidecar rewrites IMG_EMB before each SUBMIT and
  * removes it when the turn carries no image. Safe without locking because a KDA model
  * is pinned to one sequence (KV_SLOTS>1 is refused at startup). */
 static void img_emb_free(void){
     free(g_img_emb); g_img_emb=NULL; g_img_pos0=-1; g_img_n=0;
+    free(g_img_map); g_img_map=NULL; g_img_maplen=0;
 }
 
 static void img_emb_load(int D){
@@ -8126,10 +8133,9 @@ static void img_emb_load(int D){
  * there and keeping the two in step -- a seam, and this port has paid for
  * enough of those. g_img_pos0 is discovered by img_emb_locate() instead. */
 static inline void embed_row_at(Model *m,int tok,float *x,int abs_pos){
-    if(g_img_emb && g_img_pos0>=0 && abs_pos>=g_img_pos0 && abs_pos<g_img_pos0+g_img_n
-       && (tok==m->c.image_tok || (m->c.video_tok>0 && tok==m->c.video_tok))){
+    if(g_img_map && abs_pos>=0 && abs_pos<g_img_maplen && g_img_map[abs_pos]>=0){
         int D=m->c.hidden;
-        memcpy(x, g_img_emb+(int64_t)(abs_pos-g_img_pos0)*D, (size_t)D*sizeof(float));
+        memcpy(x, g_img_emb+(int64_t)g_img_map[abs_pos]*D, (size_t)D*sizeof(float));
         return;
     }
     embed_row(m,tok,x);
@@ -8150,8 +8156,18 @@ static void img_emb_locate(Model *m,const int *ids,int n){
                 count,g_img_n);
         img_emb_free(); return;
     }
+    g_img_map=(int*)malloc((size_t)n*sizeof(int));
+    if(!g_img_map){ fprintf(stderr,"[IMG] out of memory building the position map\n"); img_emb_free(); return; }
+    g_img_maplen=n;
+    int row=0, last=first;
+    for(int i=0;i<n;i++){
+        int ph = (itok>0&&ids[i]==itok)||(vtok>0&&ids[i]==vtok);
+        g_img_map[i] = ph ? row++ : -1;
+        if(ph) last=i;
+    }
     g_img_pos0=first;
-    fprintf(stderr,"[IMG] %d rows bound to placeholders at %d..%d\n",g_img_n,first,first+count-1);
+    fprintf(stderr,"[IMG] %d rows bound to %d placeholders spanning %d..%d (%d gap tokens)\n",
+            g_img_n,count,first,last,(last-first+1)-count);
 }
 
 static void kv_alloc(Model *m, int max_t){

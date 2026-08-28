@@ -398,30 +398,47 @@ fine; video sources are now spilled to a temp file. And the running server had
 `vision_sidecar` already imported, so the fix appeared to do nothing until restart
 -- a failure mode easily mistaken for a wrong fix.
 
-**Motion is NOT perceived** -- established, not assumed. Two clips built from the
-same frames, one the exact reverse of the other: a black ball travelling between a
-fixed red square (left) and a fixed blue square (right). Every static cue is
-identical; only the frame order differs. `vision/probe_motion.py` runs both:
+**Motion IS understood, but only if the question is decomposed.** An earlier
+version of this finding said motion was not perceived and blamed the architecture.
+That explanation was wrong, and the correction is the more useful result.
+
+The control: two clips from identical frames, one the exact reverse -- a black ball
+travelling between a fixed red square (left) and a fixed blue square (right). Only
+frame order differs.
+
+| prompt | result |
+|---|---|
+| "which direction does it move?" | same answer to both clips -- **fails** |
+| "where is the ball in Frame 1? in Frame 4?" | correct, and **inverted** for the reversed clip |
+| staged: frame 1, then frame 4, then conclude | correct, including the direction |
 
 ```
-clip red -> blue :  "FROM the red square TOWARD the blue square"     correct
-clip blue -> red :  "FROM the red square TOWARD the blue square"     WRONG, identical
+LR (truth red -> blue):  Frame 1 near RED,  Frame 4 near BLUE
+RL (truth blue -> red):  Frame 1 near BLUE, Frame 4 near RED
+                         "the black ball moves FROM the BLUE square"
 ```
 
-The same answer to clips that differ only in time. The first was a coin flip, in
-exactly the way the spatial "top-left" answer had been before its own control.
+A coin flip gives the same answer twice; these invert. The temporal channel exists
+and works -- the model just will not perform the two-frame comparison spontaneously.
 
-Why, as far as can be told without a reference: the tower encodes position in 2D
-only -- the same (h, w) repeated per temporal step -- so nothing inside it marks
-which frame a token came from. Order survives only as sequence order, and GLM-5.3's
-text stack is NoPE: no positional encoding anywhere. Qwen2-VL and GLM-4V supply the
-missing time axis through mRoPE's temporal component in the *text* model; GLM-5.3
-has no such channel and what replaces it is unknown. Token strings and ids were
-ruled out first (`<|begin_of_video|>` 154832, `<|video|>` 154855,
-`<|end_of_video|>` 154833 all correct), as was the token layout, which is
-temporal-major and matches the reference.
+**The tower was verified correct independently**, which is what made the diagnosis
+possible. A reversed clip's last frame IS the original's first frame, and the
+embeddings say exactly that:
 
-So video is usable for "what is in this clip", not for "what happens in it".
+```
+LR step 0 vs RL step 0 (same index, different content)  cos 0.8315
+LR step 0 vs RL step 3 (time-mirrored, same content)    cos 0.9297   <- higher
+```
+
+Two enabling changes. The engine now maps placeholder position -> row with an
+explicit table instead of `pos0 + offset`, so the run need not be contiguous; the
+server interleaves readable `Frame k:` labels between the per-frame blocks
+(`1024 rows bound to 1024 placeholders spanning 10..1051 (18 gap tokens)`). The
+labels alone did not fix the direct question -- decomposing it did -- but they are
+what makes frames individually addressable.
+
+Practical recipe: ask per frame, then conclude. `vision/probe_motion.py` reproduces
+the failure, `vision/probe_motion_staged.py` the success.
 
 **Also not covered:** accuracy degrades with two images (a layout the single-image
 run counted correctly came back as "four puzzles in a 2x2 grid"), and there is still
