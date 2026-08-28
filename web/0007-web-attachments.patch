@@ -1,0 +1,291 @@
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 1b137f8..2c09a34 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -18,6 +18,8 @@ import {
+   LoaderCircle,
+   MemoryStick,
+   MessageSquareText,
++  Paperclip,
++  X,
+   MonitorDot,
+   RefreshCw,
+   SlidersHorizontal,
+@@ -30,7 +32,7 @@ import { Badge } from "@/components/ui/badge"
+ import { Button } from "@/components/ui/button"
+ import { Input } from "@/components/ui/input"
+ import { Textarea } from "@/components/ui/textarea"
+-import { getHealth, listModels, streamChat, type ChatMessage, type HealthResponse, type StreamChatResult } from "@/lib/api"
++import { getHealth, listModels, streamChat, type ChatMessage, type HealthResponse, type StreamChatResult, type Attachment } from "@/lib/api"
+ import { activeRequests, supportsCacheSlots } from "@/lib/runtime"
+ import { Brain } from "./Brain"
+ import { Profiling } from "./Profiling"
+@@ -39,10 +41,27 @@ import { Markdown } from "@/components/Markdown"
+ import { cn } from "@/lib/utils"
+ import { useLocale } from "./i18n"
+ 
+-const message = (role: ChatMessage["role"], content: string): ChatMessage => {
++const message = (role: ChatMessage["role"], content: string, attachments?: Attachment[]): ChatMessage => {
+   let id: string
+   try { id = crypto.randomUUID() } catch { id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16) }) }
+-  return { id, role, content }
++  return attachments && attachments.length ? { id, role, content, attachments } : { id, role, content }
++}
++
++/* Files become data: URIs so a conversation stays self-contained in localStorage
++   and needs no upload endpoint. The server raises its request cap to 32 MB when a
++   vision tower is present; base64 inflates by ~4/3, so warn a little below that. */
++const MAX_ATTACH_BYTES = 22 * 1024 * 1024
++
++async function readAttachment(file: File): Promise<Attachment> {
++  if (file.size > MAX_ATTACH_BYTES)
++    throw new Error(`${file.name} is ${(file.size / 1048576).toFixed(1)} MB; the limit is ${MAX_ATTACH_BYTES / 1048576} MB`)
++  const url: string = await new Promise((resolve, reject) => {
++    const reader = new FileReader()
++    reader.onload = () => resolve(String(reader.result))
++    reader.onerror = () => reject(new Error(`could not read ${file.name}`))
++    reader.readAsDataURL(file)
++  })
++  return { kind: file.type.startsWith("video/") ? "video" : "image", url, name: file.name }
+ }
+ 
+ export default function App() {
+@@ -67,6 +86,8 @@ export default function App() {
+   const [healthError, setHealthError] = useState("")
+   const [lastRun, setLastRun] = useState<StreamChatResult | null>(null)
+   const [draft, setDraft] = useState("")
++  const [pending, setPending] = useState<Attachment[]>([])
++  const fileRef = useRef<HTMLInputElement | null>(null)
+   const [loading, setLoading] = useState(false)
+   const [streamStart, setStreamStart] = useState<number | null>(null)
+   const [tokenCount, setTokenCount] = useState(0)
+@@ -179,15 +200,32 @@ export default function App() {
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [servedByEngine, connected])
+ 
+-  const canSend = useMemo(() => draft.trim() && model && !loading, [draft, loading, model])
++  const canSend = useMemo(() => (draft.trim() || pending.length) && model && !loading, [draft, pending, loading, model])
++
++  /* Reads every picked file before touching state: awaiting inside the setPending
++     updater would put an await in a non-async callback, and a partial batch on the
++     way to an error is worse than none. */
++  const onPickFiles = async (event: React.ChangeEvent<HTMLInputElement>) => {
++    const files = Array.from(event.target.files ?? [])
++    event.target.value = ""
++    if (!files.length) return
++    try {
++      const read = await Promise.all(files.map(readAttachment))
++      setPending((prev) => [...prev, ...read])
++    } catch (err) {
++      setError(err instanceof Error ? err.message : String(err))
++    }
++  }
+ 
+   const send = async () => {
+     const content = draft.trim()
+-    if (!content || loading) return
+-    const user = message("user", content)
++    /* An attachment on its own is a valid turn -- "what is this?" is implied. */
++    if ((!content && !pending.length) || loading) return
++    const user = message("user", content, pending)
+     const assistant = message("assistant", "")
+     const history = [...messages, user]
+     setDraft("")
++    setPending([])
+     setError("")
+     updateMessages([...history, assistant])
+     setLoading(true)
+@@ -376,7 +414,17 @@ export default function App() {
+               {messages.map((item) => (
+                 <article key={item.id} className={cn("message", item.role)}>
+                   <div className="avatar">{item.role === "user" ? "Y" : <Feather className="size-4" />}</div>
+-                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.reasoning
++                  <div><div className="message-meta">{item.role === "user" ? t("chat.you") : t("chat.colibri")}</div><div className="message-body">{item.attachments?.length
++                    ? <div className="attach-strip in-message">
++                        {item.attachments.map((a, i) => (
++                          <div key={`${a.name}-${i}`} className="attach-chip" title={a.name}>
++                            {a.kind === "image"
++                              ? <img src={a.url} alt={a.name} />
++                              : <video src={a.url} controls muted />}
++                          </div>
++                        ))}
++                      </div>
++                    : null}{item.reasoning
+                     ? <details className="reasoning" open={!item.content}>
+                         <summary>{t("sidebar.reasoning")}</summary>
+                         <div className="reasoning-body">{item.reasoning}</div>
+@@ -399,8 +447,21 @@ export default function App() {
+         <div className="composer-wrap">
+           {error && <div className="error-banner" role="alert">{t(error)}</div>}
+           <div className="composer">
++            {pending.length > 0 && (
++              <div className="attach-strip">
++                {pending.map((a, i) => (
++                  <div key={`${a.name}-${i}`} className="attach-chip" title={a.name}>
++                    {a.kind === "image"
++                      ? <img src={a.url} alt={a.name} />
++                      : <video src={a.url} muted />}
++                    <span className="attach-name">{a.name}</span>
++                    <button aria-label={t("chat.removeAttachment")} onClick={() => setPending((prev) => prev.filter((_, j) => j !== i))}><X className="size-3" /></button>
++                  </div>
++                ))}
++              </div>
++            )}
+             <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={t("chat.placeholder")} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send() } }} />
+-            <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> {t("chat.inputHint")}</span>{loading ? <Button variant="destructive" size="icon" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label={t("chat.send")} disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div>
++            <div className="composer-foot"><span><MessageSquareText className="size-3.5" /> {t("chat.inputHint")}</span><div className="composer-actions"><input ref={fileRef} type="file" accept="image/*,video/*" multiple hidden onChange={(event) => void onPickFiles(event)} /><Button variant="ghost" size="icon" aria-label={t("chat.attach")} title={t("chat.attach")} disabled={loading} onClick={() => fileRef.current?.click()}><Paperclip className="size-4" /></Button>{loading ? <Button variant="destructive" size="icon" aria-label={t("chat.stop")} onClick={() => abortRef.current?.abort()}><CircleStop className="size-4" /></Button> : <Button size="icon" aria-label={t("chat.send")} disabled={!canSend} onClick={() => void send()}><ArrowUp className="size-4" /></Button>}</div></div>
+           </div>
+         </div>
+         </>}
+diff --git a/web/src/i18n/de.ts b/web/src/i18n/de.ts
+index d609525..62dd4e5 100644
+--- a/web/src/i18n/de.ts
++++ b/web/src/i18n/de.ts
+@@ -74,6 +74,8 @@ const de: Record<string, string> = {
+   "chat.inputHint": "Eingabetaste zum Senden · Umschalt+Eingabetaste für Zeilenumbruch",
+   "chat.stop": "Generierung stoppen",
+   "chat.send": "Nachricht senden",
++  "chat.attach": "Bild oder Video anhaengen",
++  "chat.removeAttachment": "Anhang entfernen",
+ 
+   // Expertenkarte
+   "brain.title": "Expertenkortex",
+diff --git a/web/src/i18n/en.ts b/web/src/i18n/en.ts
+index 158971d..e1860cd 100644
+--- a/web/src/i18n/en.ts
++++ b/web/src/i18n/en.ts
+@@ -74,6 +74,8 @@ const en: Record<string, string> = {
+   "chat.inputHint": "Enter to send · Shift+Enter for newline",
+   "chat.stop": "Stop generation",
+   "chat.send": "Send message",
++  "chat.attach": "Attach image or video",
++  "chat.removeAttachment": "Remove attachment",
+ 
+   // brain
+   "brain.title": "Expert Cortex",
+diff --git a/web/src/i18n/it.ts b/web/src/i18n/it.ts
+index 7f73e1e..64e491a 100644
+--- a/web/src/i18n/it.ts
++++ b/web/src/i18n/it.ts
+@@ -65,6 +65,8 @@ const it: Record<string, string> = {
+   "chat.inputHint": "Invio per inviare · Shift+Invio per andare a capo",
+   "chat.stop": "Ferma la generazione",
+   "chat.send": "Invia messaggio",
++  "chat.attach": "Allega immagine o video",
++  "chat.removeAttachment": "Rimuovi allegato",
+ 
+   "brain.title": "Corteccia degli expert",
+   "brain.waiting": "in attesa del motore",
+diff --git a/web/src/i18n/zh-CN.ts b/web/src/i18n/zh-CN.ts
+index 97de86a..2df666b 100644
+--- a/web/src/i18n/zh-CN.ts
++++ b/web/src/i18n/zh-CN.ts
+@@ -65,6 +65,8 @@ const zhCN: Record<string, string> = {
+   "chat.inputHint": "回车发送 · Shift+回车换行",
+   "chat.stop": "停止生成",
+   "chat.send": "发送消息",
++  "chat.attach": "添加图片或视频",
++  "chat.removeAttachment": "移除附件",
+ 
+   "brain.title": "专家皮层",
+   "brain.waiting": "等待引擎连接",
+diff --git a/web/src/i18n/zh-TW.ts b/web/src/i18n/zh-TW.ts
+index c59fe94..1b9ab00 100644
+--- a/web/src/i18n/zh-TW.ts
++++ b/web/src/i18n/zh-TW.ts
+@@ -65,6 +65,8 @@ const zhTW: Record<string, string> = {
+   "chat.inputHint": "Enter 傳送 · Shift+Enter 換行",
+   "chat.stop": "停止生成",
+   "chat.send": "傳送訊息",
++  "chat.attach": "新增圖片或影片",
++  "chat.removeAttachment": "移除附件",
+ 
+   "brain.title": "專家皮層",
+   "brain.waiting": "等待引擎連線",
+diff --git a/web/src/index.css b/web/src/index.css
+index 5cf70f6..ff67f99 100644
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -228,3 +228,35 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
+ .tok-com { color: #6b7780; font-style: italic; }
+ .md-caret { display: inline-block; width: 7px; height: 13px; margin-left: 1px; background: var(--primary); opacity: .75; animation: md-blink 1s steps(2) infinite; vertical-align: text-bottom; }
+ @keyframes md-blink { 50% { opacity: 0; } }
++
++/* ---- attachments (multimodal turns) ------------------------------------- */
++.composer-actions { display: flex; align-items: center; gap: .25rem; }
++
++.attach-strip { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .5rem; }
++
++.attach-chip {
++  position: relative;
++  display: flex; align-items: center; gap: .5rem;
++  padding: .25rem .5rem .25rem .25rem;
++  border: 1px solid var(--border); border-radius: .5rem;
++  background: var(--muted); max-width: 15rem;
++}
++.attach-chip img,
++.attach-chip video { width: 2.5rem; height: 2.5rem; object-fit: cover; border-radius: .35rem; display: block; }
++.attach-name {
++  font-size: .75rem; opacity: .8;
++  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
++}
++.attach-chip button {
++  display: grid; place-items: center;
++  width: 1.25rem; height: 1.25rem; border-radius: 999px;
++  border: 0; background: transparent; cursor: pointer; opacity: .6;
++}
++.attach-chip button:hover { opacity: 1; background: var(--border); }
++
++/* Inside a sent message the preview carries the meaning, so it gets more room
++   and drops the filename and the remove control. */
++.attach-strip.in-message { margin: 0 0 .5rem; }
++.attach-strip.in-message .attach-chip { padding: 0; border: 0; background: transparent; max-width: none; }
++.attach-strip.in-message img,
++.attach-strip.in-message video { width: auto; max-width: 18rem; height: auto; max-height: 12rem; border-radius: .5rem; }
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index b793d6f..c0a5b23 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -1,9 +1,19 @@
+ export type ChatRole = "system" | "user" | "assistant"
+ 
++/* An image or video the user attached to a turn. `url` is a data: URI so the
++   whole conversation stays self-contained in localStorage and needs no upload
++   endpoint -- the server decodes it and hands the frames to the vision tower. */
++export interface Attachment {
++  kind: "image" | "video"
++  url: string
++  name: string
++}
++
+ export interface ChatMessage {
+   id: string
+   role: ChatRole
+   content: string
++  attachments?: Attachment[]
+   /* Reasoning models stream their thinking on a separate delta field before
+      the answer. Kept apart from `content` so it can be rendered as its own
+      block and excluded from what is sent back as conversation history. */
+@@ -160,7 +170,21 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
+     signal: options.signal,
+     body: JSON.stringify({
+       model: options.model,
+-      messages: options.messages.map(({ role, content }) => ({ role, content })),
++      /* A turn with attachments becomes an array of content parts; a plain text
++         turn stays a bare string, which is what every non-multimodal path expects. */
++      messages: options.messages.map(({ role, content, attachments }) =>
++        attachments && attachments.length
++          ? {
++              role,
++              content: [
++                ...attachments.map((a) =>
++                  a.kind === "video"
++                    ? { type: "video_url", video_url: { url: a.url } }
++                    : { type: "image_url", image_url: { url: a.url } }),
++                ...(content ? [{ type: "text", text: content }] : []),
++              ],
++            }
++          : { role, content }),
+       temperature: options.temperature,
+       max_completion_tokens: options.maxTokens,
+       enable_thinking: options.enableThinking,

@@ -372,10 +372,11 @@ int3-g64 is *worse than per-row int4* while also being smaller — strictly domi
 
 ```
 engine/      glm53.c (forked from colibri.c), glm53_mhc.h, test, Makefile patch
+web/         patch adding image/video attachments to colibri's chat UI
 converter/   patches: classify() routing, k-pool config, --all-f32, family registry,
              serve stop set, planner/autotune/build wiring
 validation/  oracles, fixtures, container/plan checkers
-vision/      ViT sidecar + engine injection (plumbing works, numerics do not — #15)
+vision/      ViT sidecar, engine injection, and the motion probes
 scripts/     download and convert
 docs/        FINDINGS.md, VALIDATION.md, screenshots
 ```
