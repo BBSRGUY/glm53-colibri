@@ -1,0 +1,162 @@
+diff --git a/c/openai_server.py b/c/openai_server.py
+index 588b0d7..870ebfc 100644
+--- a/c/openai_server.py
++++ b/c/openai_server.py
+@@ -6,6 +6,7 @@ import codecs
+ import collections
+ import contextlib
+ import hashlib
++import tempfile
+ import json
+ import math
+ import mimetypes
+@@ -206,6 +207,49 @@ class GenerationScheduler:
+             self.condition.notify_all()
+ 
+ 
++IMAGE_BEGIN, IMAGE_TOK, IMAGE_END = "<|begin_of_image|>", "<|image|>", "<|end_of_image|>"
++
++
++def content_text_mm(content, param, image_out, tokens_per_image):
++    """content_text(), except image parts render as a placeholder run.
++
++    The run is `tokens_per_image` copies of <|image|>, which the ENGINE later binds
++    to the sidecar's rows by scanning for image_token_id. The server deliberately
++    does not compute token offsets: that would mean a second tokenizer here, kept
++    in step with the engine's -- exactly the kind of seam this port keeps paying for.
++    """
++    if image_out is None:
++        return content_text(content, param)
++    if isinstance(content, str):
++        return content
++    if not isinstance(content, list):
++        raise APIError(400, "Message content must be a string or an array of parts.", param)
++    parts = []
++    for index, part in enumerate(content):
++        if not isinstance(part, dict):
++            raise APIError(400, "Each content part must be an object.", f"{param}.{index}")
++        kind = part.get("type")
++        if kind in ("text", "input_text"):
++            if not isinstance(part.get("text"), str):
++                raise APIError(400, "Text content parts require a string `text` field.",
++                               f"{param}.{index}.text")
++            parts.append(part["text"])
++        elif kind in ("image_url", "input_image"):
++            src = part.get("image_url")
++            if isinstance(src, dict):
++                src = src.get("url")
++            src = src or part.get("image")
++            if not isinstance(src, str) or not src:
++                raise APIError(400, "Image parts require a url (data:, http(s):, or a path).",
++                               f"{param}.{index}.image_url")
++            image_out.append(src)
++            parts.append(IMAGE_BEGIN + IMAGE_TOK * tokens_per_image + IMAGE_END)
++        else:
++            raise APIError(400, f"Unsupported content part type: {kind!r}.",
++                           f"{param}.{index}", "unsupported_content_type")
++    return "".join(parts)
++
++
+ def content_text(content, param):
+     if isinstance(content, str):
+         return content
+@@ -1271,7 +1315,7 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None,
+ 
+ 
+ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+-                tool_choice=None):
++                tool_choice=None, image_out=None, tokens_per_image=0):
+     """Render the text-only subset of the official GLM-5.2 chat template."""
+     if not isinstance(messages, list) or not messages:
+         raise APIError(400, "`messages` must be a non-empty array.", "messages")
+@@ -1326,7 +1370,8 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
+         if role in ("system", "developer"):
+             prompt.append(f"<|system|>{content_text(message.get('content'), f'messages.{index}.content')}")
+         elif role == "user":
+-            prompt.append(f"<|user|>{content_text(message.get('content'), f'messages.{index}.content')}")
++            prompt.append("<|user|>" + content_text_mm(message.get("content"),
++                          f"messages.{index}.content", image_out, tokens_per_image))
+         elif role == "assistant":
+             # content may be null when the message is purely tool_calls
+             raw = message.get("content")
+@@ -1366,7 +1411,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
+ 
+ 
+ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+-                         tool_choice=None, audio_out=None):
++                         tool_choice=None, audio_out=None, image_out=None, tokens_per_image=0):
+     """Render a chat request with the active engine's native prompt contract."""
+     if ARCH == "inkling":
+         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
+@@ -1375,6 +1420,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
+                 render_chat_qwen if ARCH == "qwen36" else
+                 render_chat_v4 if ARCH == "deepseek_v4" else
+                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
++    if renderer is render_chat:
++        return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice,
++                        image_out, tokens_per_image)
+     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
+ 
+ 
+@@ -1675,7 +1723,7 @@ def stop_policy(body, chat):
+     if not isinstance(ignore_leading, bool):
+         raise APIError(400, "`x_colibri_ignore_leading_stop` must be a boolean.",
+                        "x_colibri_ignore_leading_stop", "invalid_value")
+-    if chat and ARCH == "glm" and not sequences:
++    if chat and ARCH in ("glm", "glm53") and not sequences:
+         # The GLM chat template owns these role boundaries, so generic OpenAI
+         # clients should not need model-specific stop knowledge. Inkling has a
+         # different marker family and receives no implicit GLM stops. Treat an
+@@ -3238,8 +3286,28 @@ class APIHandler(BaseHTTPRequestHandler):
+         tools = body.get("tools") or body.get("functions") or None
+         tool_choice = body.get("tool_choice")
+         audio_clips = [] if ARCH == "inkling" else None
++        vision = getattr(self.server, "vision_ok", False)
++        images = [] if vision else None
++        tpi = 0
++        if vision:
++            import vision_sidecar
++            tpi = vision_sidecar.tokens_per_image(self.server.model_dir)
+         prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
+-                                      tools, tool_choice, audio_out=audio_clips)
++                                      tools, tool_choice, audio_out=audio_clips,
++                                      image_out=images, tokens_per_image=tpi)
++        if vision:
++            import vision_sidecar
++            if images:
++                try:
++                    rows = vision_sidecar.encode(images, self.server.model_dir,
++                                                 self.server.img_emb_path)
++                    print(f"[vision] {len(images)} image(s) -> {rows} rows", file=sys.stderr)
++                except Exception as exc:                  # noqa: BLE001
++                    vision_sidecar.clear(self.server.img_emb_path)
++                    raise APIError(400, f"Could not encode the image: {exc}", "messages")
++            else:
++                # A stale file would silently attach the previous turn's picture.
++                vision_sidecar.clear(self.server.img_emb_path)
+         self.generation(body, prompt, request_id, True, tools, tool_choice,
+                         enable_thinking=enable_thinking,
+                         audio=b"".join(audio_clips) if audio_clips else None)
+@@ -3553,6 +3621,22 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
+         if kv_slots > family.limits.max_kv_slots:
+             raise ValueError(f"{family.id} engine supports at most "
+                              f"{family.limits.max_kv_slots} KV slot(s)")
++        # Vision (glm53): the sidecar writes finished embedding rows here before each
++        # SUBMIT and removes the file on text-only turns. Path is per-server so two
++        # instances cannot read each other's images.
++        img_emb_path = os.path.join(tempfile.gettempdir(), f"coli_img_{os.getpid()}.bin")
++        server.img_emb_path = img_emb_path
++        server.model_dir = model
++        server.vision_ok = False
++        if family.id == "glm53":
++            try:
++                import vision_sidecar
++                server.vision_ok = vision_sidecar.available(model)
++            except Exception as exc:                      # noqa: BLE001 - never block text serving
++                print(f"[vision] disabled: {exc}", file=sys.stderr)
++        if server.vision_ok:
++            env = dict(env or {}); env["IMG_EMB"] = img_emb_path
++            print(f"[vision] tower available; embeddings via {img_emb_path}", file=sys.stderr)
+         runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
+         server.engine = runtime
+         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)

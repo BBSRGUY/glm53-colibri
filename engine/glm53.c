@@ -221,6 +221,7 @@ static char g_fnorm_name[64]="model.norm.weight";
 typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
+    int image_tok;                 /* image_token_id: placeholder rows come from the vision sidecar */
     int n_group, topk_group, norm_topk;
     int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
@@ -613,6 +614,9 @@ typedef struct {
     uint64_t ld_mtp, ld_main;                    /* expert_load per tipo layer (MTP int8 vs main int4) */
     uint64_t bytes_mtp, bytes_main;              /* byte letti da disco per tipo layer */
 } Model;
+
+/* vision sidecar: load image-embedding rows from IMG_EMB (defined with embed_row_at) */
+static void img_emb_load(int D);
 
 #include "quant.h"
 
@@ -1880,6 +1884,8 @@ static void load_cfg(Cfg *c, const char *snap){
       fprintf(stderr,"[cfg] %d layers: %d KDA (linear) + %d full/DSA · hc_mult=%d · %s · prefix=\"%s\"\n",
               c->n_layers, nk, c->n_layers-nk, c->hc_mult,
               c->mla_nope?"NoPE (no RoPE anywhere)":"RoPE", g_pfx);
+      c->image_tok=gi(root,"image_token_id");   /* top level, not text_config; 0 = absent */
+      if(c->image_tok>0) fprintf(stderr,"[cfg] image token %d (vision rows via IMG_EMB)\n",c->image_tok);
       if(c->swiglu_limit>0.f) fprintf(stderr,"[cfg] clamped SwiGLU limit=%.1f\n",c->swiglu_limit); 
       if(c->index_kpool_compress && c->index_kpool>1)
           fprintf(stderr,"[cfg] DSA k-pool indexer: pools of %d, top-%d\n",
@@ -2678,6 +2684,7 @@ mlp_load:
         }
     }
     m->hlast=falloc(D); m->h_all=falloc((int64_t)512*D);
+    img_emb_load(D);   /* vision sidecar rows, if any (IMG_EMB) */
 
     /* byte della parte DENSA residente (embed+lm_head+attn+mlp densa+shared+norme) */
     int64_t rb=qt_bytes(&m->embed)+qt_bytes(&m->lm_head);
@@ -8061,6 +8068,89 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
     layers_forward_rows(m,x,S,pos_base,NULL,NULL);
 }
 
+
+/* ==================== image embedding injection (vision sidecar) ====================
+ * GLM-5.3-Flash is natively multimodal, but a ViT is dense, cheap and runs once per
+ * image -- so the vision tower lives in a PyTorch sidecar (work/vision_tower.py) and
+ * hands the engine finished rows instead of being ported to C. The engine's only job
+ * is to use those rows in place of the embedding-table lookup at the image positions.
+ *
+ * IMG_EMB=<file>: int32 pos0, int32 n, int32 dim, then n*dim float32, little-endian.
+ * pos0 is the ABSOLUTE position of the first image token in the prompt, so the same
+ * file stays valid across a chunked prefill. */
+static float *g_img_emb=NULL;
+static int    g_img_pos0=-1, g_img_n=0;
+
+/* Serving reloads per request: the sidecar rewrites IMG_EMB before each SUBMIT and
+ * removes it when the turn carries no image. Safe without locking because a KDA model
+ * is pinned to one sequence (KV_SLOTS>1 is refused at startup). */
+static void img_emb_free(void){
+    free(g_img_emb); g_img_emb=NULL; g_img_pos0=-1; g_img_n=0;
+}
+
+static void img_emb_load(int D){
+    const char *path=getenv("IMG_EMB");
+    if(!path||!*path) return;
+    FILE *f=fopen(path,"rb");
+    if(!f){ return; }   /* absent = a text-only turn, not an error */
+    int32_t hdr[3];
+    if(fread(hdr,sizeof(int32_t),3,f)!=3){ fclose(f); fprintf(stderr,"[IMG] short header\n"); return; }
+    if(hdr[2]!=D){
+        fclose(f);
+        fprintf(stderr,"[IMG] embedding dim %d != model hidden %d -- refusing\n",hdr[2],D);
+        return;
+    }
+    if(hdr[0]<0 || hdr[1]<=0 || hdr[1]>1000000){
+        fclose(f); fprintf(stderr,"[IMG] implausible pos0=%d n=%d\n",hdr[0],hdr[1]); return;
+    }
+    size_t need=(size_t)hdr[1]*(size_t)D;
+    float *buf=(float*)malloc(need*sizeof(float));
+    if(!buf){ fclose(f); fprintf(stderr,"[IMG] out of memory\n"); return; }
+    if(fread(buf,sizeof(float),need,f)!=need){
+        free(buf); fclose(f); fprintf(stderr,"[IMG] short payload\n"); return;
+    }
+    fclose(f);
+    g_img_emb=buf; g_img_pos0=hdr[0]; g_img_n=hdr[1];
+    fprintf(stderr,"[IMG] %d embedding rows at positions %d..%d (dim %d) from %s\n",
+            g_img_n,g_img_pos0,g_img_pos0+g_img_n-1,D,path);
+}
+
+/* embed_row(), except an image placeholder takes its row from the sidecar.
+ *
+ * Rows are matched by TOKEN ID rather than by absolute position: the engine
+ * tokenises the prompt, so only it knows where the placeholders actually land.
+ * Making the server compute that offset would mean duplicating the tokeniser
+ * there and keeping the two in step -- a seam, and this port has paid for
+ * enough of those. g_img_pos0 is discovered by img_emb_locate() instead. */
+static inline void embed_row_at(Model *m,int tok,float *x,int abs_pos){
+    if(g_img_emb && g_img_pos0>=0 && abs_pos>=g_img_pos0 && abs_pos<g_img_pos0+g_img_n
+       && tok==m->c.image_tok){
+        int D=m->c.hidden;
+        memcpy(x, g_img_emb+(int64_t)(abs_pos-g_img_pos0)*D, (size_t)D*sizeof(float));
+        return;
+    }
+    embed_row(m,tok,x);
+}
+
+/* Find the placeholder run in a tokenised prompt and bind the sidecar rows to it.
+ * Refuses on a count mismatch rather than injecting a partial image: a half-filled
+ * run would look like a working image and answer confidently about nothing. */
+static void img_emb_locate(Model *m,const int *ids,int n){
+    if(!g_img_emb) return;
+    int tok=m->c.image_tok;
+    if(tok<=0){ fprintf(stderr,"[IMG] no image_token_id in config -- rows unused\n"); img_emb_free(); return; }
+    int first=-1,count=0;
+    for(int i=0;i<n;i++) if(ids[i]==tok){ if(first<0) first=i; count++; }
+    if(first<0){ img_emb_free(); return; }        /* no image in this turn */
+    if(count!=g_img_n){
+        fprintf(stderr,"[IMG] %d placeholders but %d embedding rows -- refusing to inject\n",
+                count,g_img_n);
+        img_emb_free(); return;
+    }
+    g_img_pos0=first;
+    fprintf(stderr,"[IMG] %d rows bound to placeholders at %d..%d\n",g_img_n,first,first+count-1);
+}
+
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
     KVState *k=m->kv;
@@ -8169,7 +8259,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
         int done=0;
         while(S-done>chunk){
             float *cx=falloc((int64_t)chunk*D);
-            for(int s=0;s<chunk;s++) embed_row(m, ids[done+s], cx+(int64_t)s*D);
+            for(int s=0;s<chunk;s++) embed_row_at(m, ids[done+s], cx+(int64_t)s*D, pos_base+done+s);
             layers_forward(m,cx,chunk,pos_base+done);
             free(cx);
             done+=chunk;
@@ -8177,7 +8267,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
         ids+=done; S-=done; pos_base+=done;
     }
     float *x=falloc((int64_t)S*D);
-    for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    for(int s=0;s<S;s++) embed_row_at(m, ids[s], x+(int64_t)s*D, pos_base+s);
     layers_forward(m,x,S,pos_base);
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
@@ -8192,7 +8282,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
 static float *step_all(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
-    for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    for(int s=0;s<S;s++) embed_row_at(m, ids[s], x+(int64_t)s*D, pos_base+s);
     layers_forward(m,x,S,pos_base);
     if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=512) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
@@ -8706,7 +8796,7 @@ static void forward_all(Model *m, const int *ids, int S, int *pred, const int *r
     int dbg = ref && getenv("DEBUG_LOGITS");
     kv_alloc(m,S);
     float *x=falloc((int64_t)S*D);
-    for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    for(int s=0;s<S;s++) embed_row_at(m, ids[s], x+(int64_t)s*D, s);
     layers_forward(m,x,S,0);
     float *lo=falloc(c->vocab);
     float *row=falloc(D);
@@ -9711,6 +9801,8 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(sub.slot>=nctx || memchr(raw,0,(size_t)sub.bytes)){
         printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
+    img_emb_free();                 /* previous turn's image must not leak into this one */
+    img_emb_load(m->c.hidden);      /* no-op unless the sidecar wrote IMG_EMB for this turn */
     if(req[sub.slot].active){
         printf("ERROR %llu SLOT_BUSY\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
@@ -9775,6 +9867,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * first with an ERROR, so a request yields exactly one of ACCEPT or an early ERROR -- which
      * lets a CONTEXT_EXCEEDED become a clean HTTP 400 instead of a broken already-200 stream. */
     printf("ACCEPT %llu %d\n",sub.id,nt); fflush(stdout);
+    img_emb_locate(m,tmp,nt);       /* bind sidecar rows to the placeholder run, if any */
     /* Echo read-out (U7a): needs logits at EVERY prompt position, so the whole
      * prompt re-prefills from position 0 -- no cached-prefix skip and no
      * cross-slot adoption below (either would leave positions with no logits). */

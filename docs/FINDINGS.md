@@ -280,6 +280,87 @@ Caveat recorded honestly: the CUDA int4 kernels are not bit-identical to the CPU
 Deterministic across runs, still correct, but no longer the same tokens as the CPU path -- so
 the component oracles, which are CPU-only, do not cover the GPU configuration.
 
+### 14. Persisted KV resumed a stale conversation across restarts
+
+The third door into the same fault as #10. `KVSAVE` defaults to 1, so the engine
+writes `.coli_kv` and on the next start reports:
+
+```
+[KV] resumed conversation from disk: 1219 tokens in 0.2s (no re-prefill)
+```
+
+"no re-prefill" is sound for MLA -- the rows are position-addressed -- and
+unsound for KDA, whose recurrent state never saw those tokens. Finding #10 closed
+prefix reuse *within* a session and cross-slot adoption; this path restores state
+*before* any request, so the fix did not cover it.
+
+Symptom on real weights: a long code generation, ~2000 tokens in, spliced the
+user's own earlier prompt text into the middle of a CSS declaration --
+
+```css
+    justify-content: center;
+    align beautiful, good looking , royal, premium , glassmorphic design
+```
+
+-- and the model then noticed its own corruption and stopped. Short prompts never
+reached the phantom region, which is why the earlier "Hello" tests came back clean
+and this only appeared on a long generation.
+
+Fixed operationally with `KVSAVE=0`. The principled fix is to refuse persistence
+whenever a KDA layer is present, as prefix reuse now does.
+
+### 15. Vision: infrastructure complete, tower numerics NOT solved
+
+GLM-5.3-Flash is natively multimodal and the 563.6M ViT converts into the
+container. A sidecar (`vision/`) plus an engine injection path now carry image
+embeddings end to end. **The model still cannot see.** Recording this because the
+negative results cost real time and are worth not repeating.
+
+**What works and is verified.** The tower loads all 347 BF16 tensors from one
+shard, runs deterministically (bit-exact across runs), and emits 256 x 4096 --
+exactly the text hidden size. The engine binds rows to the placeholder run by
+scanning for `image_token_id`, rather than trusting the server to compute token
+offsets, and refuses on a count mismatch:
+
+```
+[vision] 1 image(s) -> 256 rows
+[IMG] 256 rows bound to placeholders at 4..259
+```
+
+The server accepts `image_url` parts, caches the tower, and writes the file
+atomically. colibri's Python suite stays at 699 passed / 0 failed.
+
+**What is broken.** The 24 ViT blocks preserve global content and destroy local
+content:
+
+| stage | red-patch vs blue-patch cosine |
+|---|---|
+| patch embedding | **0.023** (near-orthogonal, correct) |
+| after 24 blocks + merge | **0.975** (content gone) |
+
+Whole-image signal survives (black vs white = 0.41), but within one image the 256
+tokens barely differ (spread 0.0001 on a uniform frame). Attention pools globally,
+so "what is at position (4,4)" never reaches the text model. Every symptom follows
+from that one fact: correct "blank" detection, wrong corner answers, and a black
+frame described as white.
+
+**Ruled out by measurement, not argument:**
+
+* pixel preprocessing and the conv3d patch embed -- discriminates perfectly
+* pre-norm vs post-norm -- post-norm is degenerate (cosine 1.0000, spread 0)
+* the 2D RoPE convention -- rows-first beat both no-RoPE and cols-first
+* attention logit scale -- swept 1x..8x, 0.975 -> 0.953 only
+* embedding magnitude -- the tower's rows are ~42x `embed_tokens`; matching the
+  scale changed nothing, and normalising each image to a fixed L2 made it *worse*
+  by erasing the magnitude channel the tower uses for brightness
+
+**Method note.** The first spatial test passed -- "which corner is the red
+circle?" answered "top left", correctly. Flipping the image showed it answers
+"top left" regardless. A four-way question passed on a coin flip, and without the
+flipped control this would have shipped as working vision. The coarsest test
+(black vs white) should also have come before any tower archaeology; bisecting
+from the cheapest question first would have saved hours.
+
 ---
 
 ## The prefix, four times
