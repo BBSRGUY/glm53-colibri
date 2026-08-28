@@ -63,6 +63,86 @@ def tokens_per_image(ckpt):
     return TOKENS_PER_IMAGE
 
 
+def video_frames():
+    """Frames sampled per clip. Must be a multiple of temporal_patch_size, and is
+    fixed rather than derived from the clip so the server can emit the right number
+    of placeholders BEFORE the tower runs."""
+    n = int(os.environ.get("VISION_VIDEO_FRAMES", "8"))
+    return max(2, n - (n % 2))
+
+
+def tokens_per_video(ckpt):
+    per = tokens_per_image(ckpt)
+    return (video_frames() // _STATE["cfg"]["temporal_patch_size"]) * per
+
+
+def _materialise(src):
+    """Return (path, cleanup). OpenCV decodes from a file path only, so a data: URI
+    or http(s) URL is spilled to a temp file first -- unlike images, which PIL reads
+    straight from bytes."""
+    if not src.startswith(("data:", "http://", "https://")):
+        return src, None
+    import tempfile
+    if src.startswith("data:"):
+        head, _, payload = src.partition(",")
+        raw = base64.b64decode(payload)
+        ext = ".mp4"
+        if "/" in head:
+            sub = head.split("/", 1)[1].split(";")[0]
+            if sub.isalnum():
+                ext = "." + sub
+    else:
+        with urllib.request.urlopen(src, timeout=30) as r:
+            raw = r.read()
+        ext = os.path.splitext(src.split("?")[0])[1] or ".mp4"
+    fd, path = tempfile.mkstemp(suffix=ext, prefix="coli_vid_")
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw)
+    return path, path
+
+
+def _sample_frames(src, n, size):
+    """n evenly spaced frames, decoded with OpenCV and resized to size x size."""
+    import cv2, numpy as np
+    path, tmp = _materialise(src)
+    try:
+        return _sample_frames_path(path, n, size)
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _sample_frames_path(path, n, size):
+    import cv2, numpy as np
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"cannot open video: {path}")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    idxs = ([int(round(i * (total - 1) / (n - 1))) for i in range(n)]
+            if total > 1 else [0] * n)
+    out, want = [], set(idxs)
+    grabbed, pos = {}, 0
+    while len(grabbed) < len(want):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if pos in want:
+            f = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            grabbed[pos] = cv2.resize(f, (size, size), interpolation=cv2.INTER_AREA)
+        pos += 1
+    cap.release()
+    if not grabbed:
+        raise RuntimeError(f"decoded no frames from {path}")
+    last = None
+    for i in idxs:                      # tolerate short/undecodable tails
+        last = grabbed.get(i, last if last is not None else next(iter(grabbed.values())))
+        out.append(last)
+    return np.stack(out)
+
+
 def _decode(src):
     """src is a data: URI, an http(s) URL, or a local path. Returns a PIL image."""
     from PIL import Image
@@ -93,12 +173,19 @@ def encode(images, ckpt, out_path):
         std = torch.tensor([0.26862954, 0.26130258, 0.27577711])[:, None, None]
 
         rows = []
-        for src in images:
-            from PIL import Image
-            im = _decode(src).convert("RGB").resize((size, size), Image.BICUBIC)
-            t = torch.from_numpy(np.asarray(im).copy()).float().div_(255.0).permute(2, 0, 1)
-            t = ((t - mean) / std).to(_STATE["device"])
-            rows.append(V.encode_image(t, W, cfg).cpu())
+        for item in images:
+            kind, src = item if isinstance(item, tuple) else ("image", item)
+            if kind == "video":
+                arr = _sample_frames(src, video_frames(), size)          # [T,H,W,3]
+                t = torch.from_numpy(arr).float().div_(255.0).permute(0, 3, 1, 2)
+                t = ((t - mean) / std).to(_STATE["device"])
+                rows.append(V.encode_video(t, W, cfg).cpu())
+            else:
+                from PIL import Image
+                im = _decode(src).convert("RGB").resize((size, size), Image.BICUBIC)
+                t = torch.from_numpy(np.asarray(im).copy()).float().div_(255.0).permute(2, 0, 1)
+                t = ((t - mean) / std).to(_STATE["device"])
+                rows.append(V.encode_image(t, W, cfg).cpu())
         emb = torch.cat(rows, dim=0).contiguous()
 
     # Match the text embedding scale. The tower's raw output is ~40x the magnitude of

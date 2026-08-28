@@ -378,10 +378,32 @@ vision; a 3072x4080 JPEG is ~8.4 MB base64 and the connection was dropped before
 any handler ran. Now env-configurable (`COLI_MAX_BODY`) and raised to 32 MB
 automatically when the tower is available, leaving the text-serving default alone.
 
-**Not yet covered:** accuracy degrades with two images (a layout the single-image
-run counted correctly came back as "four puzzles in a 2x2 grid"), video
-(`temporal_patch_size` 2 is exercised only by frame replication), and any numeric
-comparison against a GLM-5.3 reference, which still does not exist.
+**Video works too.** 8 frames sampled evenly from a 6 s clip, fed to the Conv3d as
+real consecutive pairs rather than one frame replicated, giving 4 temporal steps x
+256 = 1024 placeholders bound to `video_token_id` 154855:
+
+```
+prompt 1048 tokens (1024 video + 24 text), 287 s
+-> "Mario ... red cap with the M emblem, red shirt, blue overalls, white gloves,
+    brown shoes, and his signature mustache ... cartoonish video game-style landscape"
+```
+
+Every detail matches the clip. Position encoding stays 2D -- the reference repeats
+the same (h, w) indices per temporal step rather than rotating a time axis -- and
+attention runs across space *and* time, so frames can be compared.
+
+Two bugs surfaced getting there. `cv2.VideoCapture` takes a file path only, so a
+`data:` URI decoded zero frames while the image path (PIL, reads bytes) worked
+fine; video sources are now spilled to a temp file. And the running server had
+`vision_sidecar` already imported, so the fix appeared to do nothing until restart
+-- a failure mode easily mistaken for a wrong fix.
+
+**Not yet covered:** *temporal* understanding. Every detail Mario's description
+gets right is visible in a single frame, so this proves frames are decoded and read,
+not that motion is perceived; a still would answer identically. Accuracy also
+degrades with two images (a layout the single-image run counted correctly came back
+as "four puzzles in a 2x2 grid"). And there is still no GLM-5.3 reference to compare
+numerics against.
 
 ---
 

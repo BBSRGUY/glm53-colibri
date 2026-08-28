@@ -120,11 +120,26 @@ def apply_rope(x, cos, sin):
 # ---------------------------------------------------------------- forward ---
 @torch.no_grad()
 def encode_image(pixel_values, W, cfg):
-    """pixel_values: [3, H, W] float in [-1, 1] (or normalized per the processor).
+    """One still frame -> [256, 4096]. The frame is replicated across the temporal
+    patch, which is how a single image is fed to a Conv3d patch embedder."""
+    t = cfg["temporal_patch_size"]
+    return encode_video(pixel_values.unsqueeze(0).repeat(t, 1, 1, 1), W, cfg)
 
-    Returns [256, 4096] float32 — the embeddings to splice at <|image|>.
+
+@torch.no_grad()
+def encode_video(frames, W, cfg):
+    """frames: [T, 3, H, W], T a multiple of temporal_patch_size.
+
+    Returns [(T/tpatch) * 256, 4096]. The Conv3d consumes frames in groups of
+    `temporal_patch_size`, so T frames give T/tpatch temporal positions, each
+    contributing a full 16x16 spatial grid after the 2x2 merge.
+
+    Position encoding stays 2D: the reference repeats the same (h, w) indices for
+    every temporal step rather than rotating a time axis, so frames at the same
+    spatial location share a position and are separated only by content. Attention
+    is full across space AND time, which is what lets the tower compare frames.
     """
-    device = pixel_values.device
+    device = frames.device
     P      = cfg["patch_size"]          # 14
     D      = cfg["hidden_size"]         # 1024
     heads  = cfg["num_heads"]           # 16
@@ -134,16 +149,22 @@ def encode_image(pixel_values, W, cfg):
     merge  = cfg["spatial_merge_size"]  # 2
     tpatch = cfg["temporal_patch_size"] # 2
 
-    # --- patch embed: a still image is replicated across the temporal patch ---
-    x = pixel_values.unsqueeze(0)                       # [1,3,H,W]
-    x = x.unsqueeze(2).repeat(1, 1, tpatch, 1, 1)       # [1,3,T,H,W]
+    # --- patch embed over the temporal patch ---
+    T = frames.shape[0]
+    if T % tpatch:
+        raise ValueError(f"frame count {T} is not a multiple of temporal_patch_size {tpatch}")
+    x = frames.permute(1, 0, 2, 3).unsqueeze(0)         # [1,3,T,H,W]
     x = F.conv3d(x, W["model.visual.patch_embed.proj.weight"],
                  W["model.visual.patch_embed.proj.bias"],
-                 stride=(tpatch, P, P))                 # [1,1024,1,h,w]
-    _, _, _, gh, gw = x.shape
-    x = x.flatten(3).squeeze(2).squeeze(0).transpose(0, 1)   # [gh*gw, 1024]
+                 stride=(tpatch, P, P))                 # [1,1024,nt,gh,gw]
+    _, _, nt, gh, gw = x.shape
+    # [nt*gh*gw, 1024], temporal-major so each step's grid stays contiguous
+    x = x.squeeze(0).permute(1, 2, 3, 0).reshape(nt * gh * gw, D)
 
     cos, sin = rope_2d(hd, gh, gw, device)
+    if nt > 1:                                           # same (h,w) per temporal step
+        cos = cos.repeat(nt, 1)
+        sin = sin.repeat(nt, 1)
 
     for i in range(cfg["depth"]):
         b = f"model.visual.blocks.{i}."
@@ -172,12 +193,11 @@ def encode_image(pixel_values, W, cfg):
 
     x = rms_norm(x, W["model.visual.post_layernorm.weight"], eps)
 
-    # --- spatial merge: 2x2 stride-2 conv, 1024 -> 4096, halving the grid ---
-    x = x.transpose(0, 1).reshape(1, D, gh, gw)
+    # --- spatial merge: 2x2 stride-2 conv per temporal step, 1024 -> 4096 ---
+    x = x.reshape(nt, gh, gw, D).permute(0, 3, 1, 2)     # [nt, 1024, gh, gw]
     x = F.conv2d(x, W["model.visual.downsample.weight"],
                  W["model.visual.downsample.bias"], stride=merge)
-    out_dim = x.shape[1]
-    x = x.flatten(2).squeeze(0).transpose(0, 1)          # [(gh/2)*(gw/2), 4096]
+    x = x.flatten(2).transpose(1, 2).reshape(-1, x.shape[1])  # [nt*(gh/2)*(gw/2), 4096]
 
     # --- merger: proj -> LayerNorm -> GELU -> SwiGLU ---
     # Structure taken from transformers' Glm4vVisionPatchMerger, the closest published

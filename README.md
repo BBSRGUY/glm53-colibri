@@ -347,10 +347,10 @@ int3-g64 is *worse than per-row int4* while also being smaller — strictly domi
 - **Speculative decoding is disabled** and refuses to run. KDA's recurrent state cannot be
   rewound after a rejected draft, so speculation silently corrupts every later token. GLM-5.3
   forfeits MTP's speedup until snapshot/restore or verified-only advance is implemented.
-- **Vision works** (`vision/`), text and images both. A PyTorch sidecar runs the 563.6M ViT
+- **Vision works** (`vision/`) — text, images and video. A PyTorch sidecar runs the 563.6M ViT
   and the engine splices its 256 rows in at `<|image|>`. Tested on synthetic figures only —
-  real photographs, multiple images per turn and video are untested, and `temporal_patch_size`
-  is exercised only by frame replication. See finding #15: one missing GELU in the merger made
+  real photographs, multiple images per turn and 8-frame video clips all work; *temporal*
+  understanding is untested — everything verified so far is visible in a single frame. See finding #15: one missing GELU in the merger made
   it blind, and the control that caught it is worth copying.
 - **One sequence at a time.** `KV_SLOTS>1` is refused: the KDA state is per-model, not per-slot.
   Fine for single-user serving; rules out multi-tenant use.

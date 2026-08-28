@@ -221,7 +221,9 @@ static char g_fnorm_name[64]="model.norm.weight";
 typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
-    int image_tok;                 /* image_token_id: placeholder rows come from the vision sidecar */
+    int image_tok, video_tok;      /* image/video_token_id: placeholder rows come from the vision
+                                    * sidecar. Video uses a distinct id but the same mechanism:
+                                    * one row per placeholder, in prompt order. */
     int n_group, topk_group, norm_topk;
     int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
@@ -1885,7 +1887,8 @@ static void load_cfg(Cfg *c, const char *snap){
               c->n_layers, nk, c->n_layers-nk, c->hc_mult,
               c->mla_nope?"NoPE (no RoPE anywhere)":"RoPE", g_pfx);
       c->image_tok=gi(root,"image_token_id");   /* top level, not text_config; 0 = absent */
-      if(c->image_tok>0) fprintf(stderr,"[cfg] image token %d (vision rows via IMG_EMB)\n",c->image_tok);
+      c->video_tok=gi(root,"video_token_id");
+      if(c->image_tok>0) fprintf(stderr,"[cfg] image token %d, video token %d (vision rows via IMG_EMB)\n",c->image_tok,c->video_tok);
       if(c->swiglu_limit>0.f) fprintf(stderr,"[cfg] clamped SwiGLU limit=%.1f\n",c->swiglu_limit); 
       if(c->index_kpool_compress && c->index_kpool>1)
           fprintf(stderr,"[cfg] DSA k-pool indexer: pools of %d, top-%d\n",
@@ -8124,7 +8127,7 @@ static void img_emb_load(int D){
  * enough of those. g_img_pos0 is discovered by img_emb_locate() instead. */
 static inline void embed_row_at(Model *m,int tok,float *x,int abs_pos){
     if(g_img_emb && g_img_pos0>=0 && abs_pos>=g_img_pos0 && abs_pos<g_img_pos0+g_img_n
-       && tok==m->c.image_tok){
+       && (tok==m->c.image_tok || (m->c.video_tok>0 && tok==m->c.video_tok))){
         int D=m->c.hidden;
         memcpy(x, g_img_emb+(int64_t)(abs_pos-g_img_pos0)*D, (size_t)D*sizeof(float));
         return;
@@ -8137,10 +8140,10 @@ static inline void embed_row_at(Model *m,int tok,float *x,int abs_pos){
  * run would look like a working image and answer confidently about nothing. */
 static void img_emb_locate(Model *m,const int *ids,int n){
     if(!g_img_emb) return;
-    int tok=m->c.image_tok;
-    if(tok<=0){ fprintf(stderr,"[IMG] no image_token_id in config -- rows unused\n"); img_emb_free(); return; }
+    int itok=m->c.image_tok, vtok=m->c.video_tok;
+    if(itok<=0 && vtok<=0){ fprintf(stderr,"[IMG] no image/video token id in config -- rows unused\n"); img_emb_free(); return; }
     int first=-1,count=0;
-    for(int i=0;i<n;i++) if(ids[i]==tok){ if(first<0) first=i; count++; }
+    for(int i=0;i<n;i++) if((itok>0&&ids[i]==itok)||(vtok>0&&ids[i]==vtok)){ if(first<0) first=i; count++; }
     if(first<0){ img_emb_free(); return; }        /* no image in this turn */
     if(count!=g_img_n){
         fprintf(stderr,"[IMG] %d placeholders but %d embedding rows -- refusing to inject\n",

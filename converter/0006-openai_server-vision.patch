@@ -1,5 +1,5 @@
 diff --git a/c/openai_server.py b/c/openai_server.py
-index 588b0d7..dc5e15f 100644
+index 588b0d7..08894d0 100644
 --- a/c/openai_server.py
 +++ b/c/openai_server.py
 @@ -6,6 +6,7 @@ import codecs
@@ -19,14 +19,15 @@ index 588b0d7..dc5e15f 100644
  PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
  DEFAULT_CORS_ORIGINS = (
      "http://127.0.0.1:8000",
-@@ -206,6 +207,49 @@ class GenerationScheduler:
+@@ -206,6 +207,62 @@ class GenerationScheduler:
              self.condition.notify_all()
  
  
 +IMAGE_BEGIN, IMAGE_TOK, IMAGE_END = "<|begin_of_image|>", "<|image|>", "<|end_of_image|>"
++VIDEO_BEGIN, VIDEO_TOK, VIDEO_END = "<|begin_of_video|>", "<|video|>", "<|end_of_video|>"
 +
 +
-+def content_text_mm(content, param, image_out, tokens_per_image):
++def content_text_mm(content, param, image_out, tokens_per_image, tokens_per_video=0):
 +    """content_text(), except image parts render as a placeholder run.
 +
 +    The run is `tokens_per_image` copies of <|image|>, which the ENGINE later binds
@@ -58,8 +59,20 @@ index 588b0d7..dc5e15f 100644
 +            if not isinstance(src, str) or not src:
 +                raise APIError(400, "Image parts require a url (data:, http(s):, or a path).",
 +                               f"{param}.{index}.image_url")
-+            image_out.append(src)
++            image_out.append(("image", src))
 +            parts.append(IMAGE_BEGIN + IMAGE_TOK * tokens_per_image + IMAGE_END)
++        elif kind in ("video_url", "input_video"):
++            src = part.get("video_url")
++            if isinstance(src, dict):
++                src = src.get("url")
++            src = src or part.get("video")
++            if not isinstance(src, str) or not src:
++                raise APIError(400, "Video parts require a url or path.",
++                               f"{param}.{index}.video_url")
++            if not tokens_per_video:
++                raise APIError(400, "This build cannot encode video.", f"{param}.{index}")
++            image_out.append(("video", src))
++            parts.append(VIDEO_BEGIN + VIDEO_TOK * tokens_per_video + VIDEO_END)
 +        else:
 +            raise APIError(400, f"Unsupported content part type: {kind!r}.",
 +                           f"{param}.{index}", "unsupported_content_type")
@@ -69,45 +82,47 @@ index 588b0d7..dc5e15f 100644
  def content_text(content, param):
      if isinstance(content, str):
          return content
-@@ -1271,7 +1315,7 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None,
+@@ -1271,7 +1328,7 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None,
  
  
  def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
 -                tool_choice=None):
-+                tool_choice=None, image_out=None, tokens_per_image=0):
++                tool_choice=None, image_out=None, tokens_per_image=0, tokens_per_video=0):
      """Render the text-only subset of the official GLM-5.2 chat template."""
      if not isinstance(messages, list) or not messages:
          raise APIError(400, "`messages` must be a non-empty array.", "messages")
-@@ -1326,7 +1370,8 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
+@@ -1326,7 +1383,9 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
          if role in ("system", "developer"):
              prompt.append(f"<|system|>{content_text(message.get('content'), f'messages.{index}.content')}")
          elif role == "user":
 -            prompt.append(f"<|user|>{content_text(message.get('content'), f'messages.{index}.content')}")
 +            prompt.append("<|user|>" + content_text_mm(message.get("content"),
-+                          f"messages.{index}.content", image_out, tokens_per_image))
++                          f"messages.{index}.content", image_out, tokens_per_image,
++                          tokens_per_video))
          elif role == "assistant":
              # content may be null when the message is purely tool_calls
              raw = message.get("content")
-@@ -1366,7 +1411,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
+@@ -1366,7 +1425,8 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
  
  
  def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
 -                         tool_choice=None, audio_out=None):
-+                         tool_choice=None, audio_out=None, image_out=None, tokens_per_image=0):
++                         tool_choice=None, audio_out=None, image_out=None, tokens_per_image=0,
++                         tokens_per_video=0):
      """Render a chat request with the active engine's native prompt contract."""
      if ARCH == "inkling":
          return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
-@@ -1375,6 +1420,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
+@@ -1375,6 +1435,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                  render_chat_qwen if ARCH == "qwen36" else
                  render_chat_v4 if ARCH == "deepseek_v4" else
                  render_chat_olmoe if ARCH == "olmoe" else render_chat)
 +    if renderer is render_chat:
 +        return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice,
-+                        image_out, tokens_per_image)
++                        image_out, tokens_per_image, tokens_per_video)
      return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
  
  
-@@ -1675,7 +1723,7 @@ def stop_policy(body, chat):
+@@ -1675,7 +1738,7 @@ def stop_policy(body, chat):
      if not isinstance(ignore_leading, bool):
          raise APIError(400, "`x_colibri_ignore_leading_stop` must be a boolean.",
                         "x_colibri_ignore_leading_stop", "invalid_value")
@@ -116,20 +131,22 @@ index 588b0d7..dc5e15f 100644
          # The GLM chat template owns these role boundaries, so generic OpenAI
          # clients should not need model-specific stop knowledge. Inkling has a
          # different marker family and receives no implicit GLM stops. Treat an
-@@ -3238,8 +3286,28 @@ class APIHandler(BaseHTTPRequestHandler):
+@@ -3238,8 +3301,30 @@ class APIHandler(BaseHTTPRequestHandler):
          tools = body.get("tools") or body.get("functions") or None
          tool_choice = body.get("tool_choice")
          audio_clips = [] if ARCH == "inkling" else None
 +        vision = getattr(self.server, "vision_ok", False)
 +        images = [] if vision else None
-+        tpi = 0
++        tpi = tpv = 0
 +        if vision:
 +            import vision_sidecar
 +            tpi = vision_sidecar.tokens_per_image(self.server.model_dir)
++            tpv = vision_sidecar.tokens_per_video(self.server.model_dir)
          prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
 -                                      tools, tool_choice, audio_out=audio_clips)
 +                                      tools, tool_choice, audio_out=audio_clips,
-+                                      image_out=images, tokens_per_image=tpi)
++                                      image_out=images, tokens_per_image=tpi,
++                                      tokens_per_video=(tpv if vision else 0))
 +        if vision:
 +            import vision_sidecar
 +            if images:
@@ -146,7 +163,7 @@ index 588b0d7..dc5e15f 100644
          self.generation(body, prompt, request_id, True, tools, tool_choice,
                          enable_thinking=enable_thinking,
                          audio=b"".join(audio_clips) if audio_clips else None)
-@@ -3553,6 +3621,30 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
+@@ -3553,6 +3638,30 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
          if kv_slots > family.limits.max_kv_slots:
              raise ValueError(f"{family.id} engine supports at most "
                               f"{family.limits.max_kv_slots} KV slot(s)")
