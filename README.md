@@ -121,9 +121,9 @@ all-f32 container, and runs on the real 320B weights.
 
 ---
 
-## Thirteen findings, three of them upstream
+## Fifteen findings, three of them upstream
 
-Bringing up an architecture nobody had run before surfaced thirteen distinct findings, each
+Bringing up an architecture nobody had run before surfaced fifteen distinct findings, each
 documented with its mechanism and fix in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 **Three affect colibri generally, not just GLM-5.3** — most valuably a resume path that
@@ -334,12 +334,18 @@ int3-g64 is *worse than per-row int4* while also being smaller — strictly domi
 - **Speculative decoding is disabled** and refuses to run. KDA's recurrent state cannot be
   rewound after a rejected draft, so speculation silently corrupts every later token. GLM-5.3
   forfeits MTP's speedup until snapshot/restore or verified-only advance is implemented.
-- **Vision is not implemented.** GLM-5.3 is natively multimodal; the 563.6M ViT converts into
-  the container (0.62 GB) and is unused. Its position encoding is parameter-free 2D RoPE — which
-  is why the checkpoint has no positional tensor. Cheapest path is a PyTorch sidecar producing
-  256 embeddings spliced at `<|image|>`.
+- **Vision: plumbing done, tower not solved.** A PyTorch sidecar (`vision/`) plus an engine
+  injection path carry 256 image embeddings end to end — verified as
+  `[IMG] 256 rows bound to placeholders at 4..259` — and the server accepts `image_url` parts.
+  **The model still cannot see.** The 24 ViT blocks preserve global content and destroy local
+  content (red-vs-blue patch cosine goes 0.023 → 0.975), so spatial questions get answered from
+  language priors. Finding #15 lists what has been ruled out by measurement, including three
+  plausible causes that turned out not to be it.
 - **One sequence at a time.** `KV_SLOTS>1` is refused: the KDA state is per-model, not per-slot.
   Fine for single-user serving; rules out multi-tenant use.
+- **Run with `KVSAVE=0`.** Persisted KV resumes a previous conversation with "no re-prefill",
+  which a recurrent state cannot honour (finding #14). It corrupted a 2000-token generation by
+  splicing earlier prompt text into the middle of a CSS declaration.
 - **KV prefix reuse is disabled** — genuinely, as of finding #10. Every turn re-prefills the
   whole conversation, which at 0.5 tok/s is the dominant cost of multi-turn chat. It is not
   optional: reuse answers from the wrong state.
@@ -356,6 +362,7 @@ engine/      glm53.c (forked from colibri.c), glm53_mhc.h, test, Makefile patch
 converter/   patches: classify() routing, k-pool config, --all-f32, family registry,
              serve stop set, planner/autotune/build wiring
 validation/  oracles, fixtures, container/plan checkers
+vision/      ViT sidecar + engine injection (plumbing works, numerics do not — #15)
 scripts/     download and convert
 docs/        FINDINGS.md, VALIDATION.md, screenshots
 ```
