@@ -309,57 +309,64 @@ and this only appeared on a long generation.
 Fixed operationally with `KVSAVE=0`. The principled fix is to refuse persistence
 whenever a KDA layer is present, as prefix reuse now does.
 
-### 15. Vision: infrastructure complete, tower numerics NOT solved
+### 15. Vision: one missing GELU made the model blind
 
-GLM-5.3-Flash is natively multimodal and the 563.6M ViT converts into the
-container. A sidecar (`vision/`) plus an engine injection path now carry image
-embeddings end to end. **The model still cannot see.** Recording this because the
-negative results cost real time and are worth not repeating.
+GLM-5.3-Flash is natively multimodal. A sidecar (`vision/`) plus an engine
+injection path now carry image embeddings end to end, and the model reads them.
 
-**What works and is verified.** The tower loads all 347 BF16 tensors from one
-shard, runs deterministically (bit-exact across runs), and emits 256 x 4096 --
-exactly the text hidden size. The engine binds rows to the placeholder run by
-scanning for `image_token_id`, rather than trusting the server to compute token
-offsets, and refuses on a count mismatch:
+**The bug.** The patch merger applies GELU between its LayerNorm and its SwiGLU:
 
-```
-[vision] 1 image(s) -> 256 rows
-[IMG] 256 rows bound to placeholders at 4..259
+```python
+hidden = self.act1(self.post_projection_norm(self.proj(hidden)))   # act1 = GELU
+return self.down_proj(self.act_fn(self.gate_proj(hidden)) * self.up_proj(hidden))
 ```
 
-The server accepts `image_url` parts, caches the tower, and writes the file
-atomically. colibri's Python suite stays at 699 passed / 0 failed.
+Nothing in the checkpoint hints at that activation -- tensor names give you `proj`,
+`post_projection_norm`, `gate/up/down_proj` and no more. Omitting it did not merely
+shift the numbers, it destroyed the tower's spatial resolution:
 
-**What is broken.** The 24 ViT blocks preserve global content and destroy local
-content:
+| | without GELU | with GELU |
+|---|---|---|
+| red-patch vs blue-patch, same image | 0.9836 | **0.6859** |
+| mean row L2 vs `embed_tokens` (0.604) | 25.2 (42x) | **0.94** |
 
-| stage | red-patch vs blue-patch cosine |
-|---|---|
-| patch embedding | **0.023** (near-orthogonal, correct) |
-| after 24 blocks + merge | **0.975** (content gone) |
+The 42x magnitude anomaly was a *symptom* of the missing activation, not a separate
+problem -- which is why rescaling the embeddings to match the text distribution
+achieved nothing, and why normalising each image to a fixed L2 made things worse by
+erasing the magnitude channel the tower uses for brightness.
 
-Whole-image signal survives (black vs white = 0.41), but within one image the 256
-tokens barely differ (spread 0.0001 on a uniform frame). Attention pools globally,
-so "what is at position (4,4)" never reaches the text model. Every symptom follows
-from that one fact: correct "blank" detection, wrong corner answers, and a black
-frame described as white.
+**How it was found.** By reading `Glm4vVisionPatchMerger` in transformers. GLM-5.3
+has no reference implementation, and that was treated as final for far too long --
+but the closely related **GLM-4V does**, and its merger transferred directly. When a
+model has no reference, look for its nearest published relative before reasoning
+from tensor names alone.
 
-**Ruled out by measurement, not argument:**
+**Verified behaviour** (was wrong on all three before the fix):
 
-* pixel preprocessing and the conv3d patch embed -- discriminates perfectly
-* pre-norm vs post-norm -- post-norm is degenerate (cosine 1.0000, spread 0)
-* the 2D RoPE convention -- rows-first beat both no-RoPE and cols-first
-* attention logit scale -- swept 1x..8x, 0.975 -> 0.953 only
-* embedding magnitude -- the tower's rows are ~42x `embed_tokens`; matching the
-  scale changed nothing, and normalising each image to a fixed L2 made it *worse*
-  by erasing the magnitude channel the tower uses for brightness
+```
+black frame  -> "The image is completely black with no visible content."
+white frame  -> "The image is completely blank and white."
+red circle top-left      -> "top-left"
+red circle bottom-right  -> "bottom-right"      <- answers DIFFER, and both correct
+```
 
-**Method note.** The first spatial test passed -- "which corner is the red
-circle?" answered "top left", correctly. Flipping the image showed it answers
-"top left" regardless. A four-way question passed on a coin flip, and without the
-flipped control this would have shipped as working vision. The coarsest test
-(black vs white) should also have come before any tower archaeology; bisecting
-from the cheapest question first would have saved hours.
+**Method note, kept because it nearly cost the whole result.** The first spatial test
+passed and meant nothing: "which corner is the red circle?" answered "top left",
+correctly -- then answered "top left" again with the image flipped. A four-way
+question passed on a coin flip, and without that control this would have shipped as
+working vision while being entirely blind. The cheapest possible check (black vs
+white) should also have come before any tower archaeology.
+
+**Confirmed correct along the way**, each by measurement rather than argument: pixel
+preprocessing and the conv3d patch embed (patch-level cosine 0.023), pre-norm block
+order (post-norm is degenerate -- cosine 1.0000, zero spread), the 2D RoPE convention
+(rows-first beat no-RoPE and cols-first; the rotate-half expansion is provably
+identical to the reference), `post_layernorm` placement after the blocks, and the
+full-grid stride-2 downsample (equivalent to the reference's per-block reshape).
+
+**Not yet covered:** real photographs, multiple images per turn, video
+(`temporal_patch_size` 2 is exercised only by frame replication), and any numeric
+comparison against a GLM-5.3 reference, which still does not exist.
 
 ---
 

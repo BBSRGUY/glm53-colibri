@@ -179,13 +179,19 @@ def encode_image(pixel_values, W, cfg):
     out_dim = x.shape[1]
     x = x.flatten(2).squeeze(0).transpose(0, 1)          # [(gh/2)*(gw/2), 4096]
 
-    # --- merger: proj -> LayerNorm -> SwiGLU ---
+    # --- merger: proj -> LayerNorm -> GELU -> SwiGLU ---
+    # Structure taken from transformers' Glm4vVisionPatchMerger, the closest published
+    # relative:  hidden = act1(post_projection_norm(proj(hidden)))  with act1 = GELU,
+    # then down(silu(gate(h)) * up(h)). The GELU is easy to miss from tensor names alone
+    # -- nothing in the checkpoint hints at it -- and the merger carries no clamp either;
+    # swiglu_limit belongs to the blocks.
     m = "model.visual.merger."
     x = F.linear(x, W[m + "proj.weight"])
     x = layer_norm(x, W[m + "post_projection_norm.weight"],
                    W[m + "post_projection_norm.bias"], eps)
-    g = F.linear(x, W[m + "gate_proj.weight"]).clamp(max=limit)
-    u = F.linear(x, W[m + "up_proj.weight"]).clamp(min=-limit, max=limit)
+    x = F.gelu(x)
+    g = F.linear(x, W[m + "gate_proj.weight"])
+    u = F.linear(x, W[m + "up_proj.weight"])
     x = F.linear(F.silu(g) * u, W[m + "down_proj.weight"])
     return x.float()
 

@@ -55,6 +55,19 @@ like a disk bottleneck but was really a latency one: the drive was only 15% busy
 
 </div>
 
+### Multimodal
+
+```
+black frame                 -> "The image is completely black with no visible content."
+white frame                 -> "The image is completely blank and white."
+red circle, top-left        -> "The red circle is in the top-left corner."
+red circle, bottom-right    -> "The red circle is in the bottom-right corner."
+```
+
+The last two matter more than they look: the same question over a flipped image, giving
+different and correct answers. An earlier build answered "top-left" to both — passing the
+first test by luck while being completely blind. 285 prompt tokens (256 image + 29 text).
+
 ---
 
 ## Why this needed writing
@@ -334,13 +347,11 @@ int3-g64 is *worse than per-row int4* while also being smaller — strictly domi
 - **Speculative decoding is disabled** and refuses to run. KDA's recurrent state cannot be
   rewound after a rejected draft, so speculation silently corrupts every later token. GLM-5.3
   forfeits MTP's speedup until snapshot/restore or verified-only advance is implemented.
-- **Vision: plumbing done, tower not solved.** A PyTorch sidecar (`vision/`) plus an engine
-  injection path carry 256 image embeddings end to end — verified as
-  `[IMG] 256 rows bound to placeholders at 4..259` — and the server accepts `image_url` parts.
-  **The model still cannot see.** The 24 ViT blocks preserve global content and destroy local
-  content (red-vs-blue patch cosine goes 0.023 → 0.975), so spatial questions get answered from
-  language priors. Finding #15 lists what has been ruled out by measurement, including three
-  plausible causes that turned out not to be it.
+- **Vision works** (`vision/`), text and images both. A PyTorch sidecar runs the 563.6M ViT
+  and the engine splices its 256 rows in at `<|image|>`. Tested on synthetic figures only —
+  real photographs, multiple images per turn and video are untested, and `temporal_patch_size`
+  is exercised only by frame replication. See finding #15: one missing GELU in the merger made
+  it blind, and the control that caught it is worth copying.
 - **One sequence at a time.** `KV_SLOTS>1` is refused: the KDA state is per-model, not per-slot.
   Fine for single-user serving; rules out multi-tenant use.
 - **Run with `KVSAVE=0`.** Persisted KV resumes a previous conversation with "no re-prefill",

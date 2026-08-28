@@ -111,7 +111,7 @@ def encode(images, ckpt, out_path):
     # to a fixed L2 erases precisely that signal -- measured, after it made the model
     # call a black image "white". 41.7 is the ratio of the tower's mean row L2 to the
     # container's embed_tokens mean row L2, so relative differences survive.
-    div = float(os.environ.get("VISION_DIV", "41.7"))
+    div = float(os.environ.get("VISION_DIV", "1.0"))   # tower now lands near embed scale on its own
     if div > 0:
         emb = emb / div
 
