@@ -233,6 +233,53 @@ and colibri's full Python suite runs green with these patches applied:
 **699 passed, 0 failed**.
 
 
+### 12. The GPU expert tier sizes its candidate list with a 2x over-estimate
+
+`glm53.c` builds the VRAM candidate list as `budget / per-expert-estimate`, and the estimate
+is roughly double the truth. On a 12 GB card:
+
+```
+[CUDA] tier staging: ... instead of 420 at once (10.6 GB)   <- 420 candidates = 10.6 GB budget
+[CUDA] hot expert tier: 420/856 experts, VRAM 5.62 GB        <- those 420 occupied 5.62 GB
+```
+
+420 experts nominated for a 10.6 GB budget, consuming 5.62 GB: **25.2 MB assumed per expert,
+13.4 MB actual**. VRAM stops half full regardless of what budget it is given, and no amount of
+raising `CUDA_EXPERT_GB` fixes it, because that value *is* the numerator.
+
+Proven by forcing the pin set far larger (`COLI_RAM_OVERCOMMIT=1 PIN=auto PIN_GB=11`, 856
+experts pinned, 16 GB warm): VRAM still took exactly 420 and pushed the remaining 436 to RAM.
+Host memory was not the constraint; the arithmetic was.
+
+Worked around by declaring a budget larger than the card (`CUDA_EXPERT_GB=20` on a 12 GB GPU),
+which yields ~790 candidates. The per-device capacity check still stops placement safely, at
+**791 experts / 10.58 GB of 12.3 GB**. Worth +14% throughput.
+
+A real fix belongs in the estimate rather than the env var; the figure appears to count host
+and device copies of the same expert, which `CUDA_RELEASE_HOST` then frees.
+
+### 13. Three configuration levers were worth 2x, and the docs said RAM was the only one
+
+Not a defect, but the most useful operational finding here. Same hardware, same weights:
+
+| step | tok/s |
+|---|---:|
+| defaults | 0.384 |
+| `DIRECT=1 PIPE=1` | 0.487 |
+| VRAM filled (#12) | 0.555 |
+| dual-NVMe striping | **0.755** |
+
+The diagnosis that made it possible: the engine reported **49% "I/O wait"** while the drive
+was only **15% busy** at queue depth **0.9**. I/O wait means the compute thread is blocked; it
+does not mean the device is saturated. The workload was latency-bound, not bandwidth-bound --
+so `O_DIRECT` (skip a page cache that was copying 4 GB/token through RAM the machine lacks)
+and read striping across two NVMe drives both paid, while adding GPU capacity barely did.
+
+Caveat recorded honestly: the CUDA int4 kernels are not bit-identical to the CPU ones. With
+791 experts resident on the GPU, "Hello" answers `'Hi! ...'` instead of `'Hi there! ...'`.
+Deterministic across runs, still correct, but no longer the same tokens as the CPU path -- so
+the component oracles, which are CPU-only, do not cover the GPU configuration.
+
 ---
 
 ## The prefix, four times

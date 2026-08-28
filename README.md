@@ -4,12 +4,12 @@
 
 <br>
 
-**Run [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) — 320B total / 18B active — on a consumer laptop, on the CPU, by streaming experts from NVMe.**
+**Run [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) — 320B total / 18B active — on a consumer laptop, by streaming experts from NVMe.**
 
 <br>
 
-![status](https://img.shields.io/badge/status-running_on_real_320B_weights-34d399?style=flat-square)
-![engine](https://img.shields.io/badge/engine-C%2C_CPU_only-34d399?style=flat-square)
+![status](https://img.shields.io/badge/status-0.76_tok%2Fs_on_real_320B_weights-34d399?style=flat-square)
+![engine](https://img.shields.io/badge/engine-C_·_CPU%2BCUDA-34d399?style=flat-square)
 ![quant](https://img.shields.io/badge/experts-int4--gs128-38bdf8?style=flat-square)
 ![tests](https://img.shields.io/badge/colibri_suite-699_passed_·_0_failed-34d399?style=flat-square)
 ![components](https://img.shields.io/badge/component_oracles-11%2F11-34d399?style=flat-square)
@@ -43,15 +43,15 @@ GLM-5.2 but not GLM-5.3. It is a **fork with additions**, not a new engine — s
 
 <img src="docs/img/webui-chat.png" alt="colibri web UI running glm-5.3-flash-colibri, answering a chat turn correctly" width="100%">
 
-<sub><b>320B answering on a laptop.</b> 34 GB RAM, no GPU in use, experts streamed from NVMe.
-7 requests completed, 0 failures.</sub>
+<sub><b>320B answering on a laptop.</b> 34 GB RAM, experts streamed from NVMe.
+7 requests completed, 0 failures. (Captured before the tuning work below took it to 0.76 tok/s.)</sub>
 
 <br><br>
 
 <img src="docs/img/webui-profiling.png" alt="colibri profiling view showing 73 percent of the last turn spent in I/O wait" width="100%">
 
-<sub><b>Where every turn actually goes.</b> Disk service 64.1 s overlapped with compute;
-<b>73%</b> of the last turn was I/O wait. This is a storage benchmark wearing a trench coat.</sub>
+<sub><b>Where every turn actually goes.</b> <b>73%</b> of this turn was I/O wait — which looked
+like a disk bottleneck but was really a latency one: the drive was only 15% busy. See Performance.</sub>
 
 </div>
 
@@ -121,9 +121,9 @@ all-f32 container, and runs on the real 320B weights.
 
 ---
 
-## Eleven findings, three of them upstream
+## Thirteen findings, three of them upstream
 
-Bringing up an architecture nobody had run before surfaced eleven distinct defects, each
+Bringing up an architecture nobody had run before surfaced thirteen distinct findings, each
 documented with its mechanism and fix in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 **Three affect colibri generally, not just GLM-5.3** — most valuably a resume path that
@@ -232,16 +232,54 @@ adds.
 
 ---
 
-## Where the time goes
+## Performance
 
-Measured on: **Intel Core i9-14900HX** (24 cores / 32 threads), **34 GB RAM**, Crucial P3 Plus
-NVMe. An RTX 4080 Laptop 12 GB is present but **completely unused** — this build is CPU-only
-(`CUDA=0 VK=0`), and the web UI confirms `VRAM 0.0 GB`.
+Measured on: **Intel Core i9-14900HX** (24 cores / 32 threads), **34 GB RAM**, **RTX 4080
+Laptop 12 GB**, two NVMe SSDs.
 
-Across 7 real turns (315.3 s total):
+**0.384 -> 0.760 tok/s** on identical hardware, from configuration alone:
 
-| phase | share of wall time |
-|---|---|
+| step | tok/s | gain |
+|---|---:|---:|
+| defaults | 0.384 | — |
+| `DIRECT=1 PIPE=1` | 0.487 | +27% |
+| VRAM actually filled (791 experts, 10.6 GB) | 0.555 | +14% |
+| **dual-NVMe striping** | **0.755** | **+36%** |
+
+Each lever, and why it mattered:
+
+**`DIRECT=1 PIPE=1` — bypass the OS page cache.** Buffered reads were copying ~4 GB/token
+through RAM the machine does not have. O_DIRECT took disk throughput from **606 MB/s to
+1,378 MB/s**. The engine was never disk-*bandwidth* bound: the drive sat at **15% busy**
+while the compute thread showed 49% "I/O wait". Waiting is not saturation.
+
+**Filling VRAM — worth 5 GB that a rounding error was hiding.** The GPU expert tier sizes its
+candidate list as `budget / per-expert-estimate`, and the estimate is ~2x the real figure
+(25.2 MB assumed, 13.4 MB actual). VRAM therefore stopped half full no matter what budget it
+was given. Declaring `CUDA_EXPERT_GB=20` against a 12 GB card works around it; the device
+capacity check still stops safely, at 10.58 GB. See finding #12.
+
+**Dual-NVMe striping — the largest single win.** `COLI_MIR_STRIPE` splits *one* expert read
+into 4K-aligned chunks across replicas, read in parallel. A cold ~19 MB expert read is
+single-thread latency-bound, and queue depth measured **0.9** — essentially serialised. Two
+drives halve that wait. Requires O_DIRECT and a full mirror of the container.
+
+```bash
+COLI_MODEL_MIRROR=C:/glm53-mirror COLI_RAM_OVERCOMMIT=1 PIN=auto PIN_GB=11 DIRECT=1 PIPE=1 COLI_CUDA=1 CUDA_EXPERT_GB=20 CUDA_RESERVE_GB=1 CUDA_RELEASE_HOST=1 COLI_SERVE_ALL_STOPS=1 python coli web --model /path/to/glm53-int4 --ram 17 --ctx 2048 --port 8111
+```
+
+> [!WARNING]
+> Two costs. The mirror needs a second copy of the container (168 GB), which took the system
+> drive to 95% full. And the CUDA int4 kernels are not bit-identical to the CPU ones — with
+> 791 experts on the GPU the answer to "Hello" changes from `'Hi there! How can I help you
+> today?'` to `'Hi! How can I help you today?'`. Self-consistent across runs, still correct,
+> but no longer the same tokens as the CPU path.
+
+**What is left.** More RAM is still the structural lever — 157 GB of experts against 34 GB of
+host memory means most tokens still reach disk. But "RAM is the only real lever", which this
+README previously claimed, was wrong by a factor of two.
+
+---|---|
 | **I/O wait** | **49%** |
 | Expert matmul | 27% |
 | Other | 20% |
