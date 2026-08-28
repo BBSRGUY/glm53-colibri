@@ -398,12 +398,34 @@ fine; video sources are now spilled to a temp file. And the running server had
 `vision_sidecar` already imported, so the fix appeared to do nothing until restart
 -- a failure mode easily mistaken for a wrong fix.
 
-**Not yet covered:** *temporal* understanding. Every detail Mario's description
-gets right is visible in a single frame, so this proves frames are decoded and read,
-not that motion is perceived; a still would answer identically. Accuracy also
-degrades with two images (a layout the single-image run counted correctly came back
-as "four puzzles in a 2x2 grid"). And there is still no GLM-5.3 reference to compare
-numerics against.
+**Motion is NOT perceived** -- established, not assumed. Two clips built from the
+same frames, one the exact reverse of the other: a black ball travelling between a
+fixed red square (left) and a fixed blue square (right). Every static cue is
+identical; only the frame order differs. `vision/probe_motion.py` runs both:
+
+```
+clip red -> blue :  "FROM the red square TOWARD the blue square"     correct
+clip blue -> red :  "FROM the red square TOWARD the blue square"     WRONG, identical
+```
+
+The same answer to clips that differ only in time. The first was a coin flip, in
+exactly the way the spatial "top-left" answer had been before its own control.
+
+Why, as far as can be told without a reference: the tower encodes position in 2D
+only -- the same (h, w) repeated per temporal step -- so nothing inside it marks
+which frame a token came from. Order survives only as sequence order, and GLM-5.3's
+text stack is NoPE: no positional encoding anywhere. Qwen2-VL and GLM-4V supply the
+missing time axis through mRoPE's temporal component in the *text* model; GLM-5.3
+has no such channel and what replaces it is unknown. Token strings and ids were
+ruled out first (`<|begin_of_video|>` 154832, `<|video|>` 154855,
+`<|end_of_video|>` 154833 all correct), as was the token layout, which is
+temporal-major and matches the reference.
+
+So video is usable for "what is in this clip", not for "what happens in it".
+
+**Also not covered:** accuracy degrades with two images (a layout the single-image
+run counted correctly came back as "four puzzles in a 2x2 grid"), and there is still
+no GLM-5.3 reference to compare numerics against.
 
 ---
 
