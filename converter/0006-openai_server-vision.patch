@@ -1,5 +1,5 @@
 diff --git a/c/openai_server.py b/c/openai_server.py
-index 588b0d7..870ebfc 100644
+index 588b0d7..dc5e15f 100644
 --- a/c/openai_server.py
 +++ b/c/openai_server.py
 @@ -6,6 +6,7 @@ import codecs
@@ -10,6 +10,15 @@ index 588b0d7..870ebfc 100644
  import json
  import math
  import mimetypes
+@@ -43,7 +44,7 @@ def default_engine(family=None):
+     return HERE / family.engine_artifact
+ END = b"\x01\x01END\x01\x01\n"
+ READY = b"\x01\x01READY\x01\x01\n"
+-MAX_BODY = 4 << 20
++MAX_BODY = int(os.environ.get("COLI_MAX_BODY", str(4 << 20)))
+ PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
+ DEFAULT_CORS_ORIGINS = (
+     "http://127.0.0.1:8000",
 @@ -206,6 +207,49 @@ class GenerationScheduler:
              self.condition.notify_all()
  
@@ -137,7 +146,7 @@ index 588b0d7..870ebfc 100644
          self.generation(body, prompt, request_id, True, tools, tool_choice,
                          enable_thinking=enable_thinking,
                          audio=b"".join(audio_clips) if audio_clips else None)
-@@ -3553,6 +3621,22 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
+@@ -3553,6 +3621,30 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
          if kv_slots > family.limits.max_kv_slots:
              raise ValueError(f"{family.id} engine supports at most "
                               f"{family.limits.max_kv_slots} KV slot(s)")
@@ -155,6 +164,14 @@ index 588b0d7..870ebfc 100644
 +            except Exception as exc:                      # noqa: BLE001 - never block text serving
 +                print(f"[vision] disabled: {exc}", file=sys.stderr)
 +        if server.vision_ok:
++            # A base64 photograph blows past the 4 MB text-serving cap long before it
++            # reaches the tower (a 3072x4080 JPEG is ~8.4 MB encoded), and the
++            # connection is dropped before any handler runs. Raise it for vision
++            # unless the operator pinned a value.
++            if "COLI_MAX_BODY" not in os.environ:
++                globals()["MAX_BODY"] = max(MAX_BODY, 32 << 20)
++                print(f"[vision] max request body raised to {MAX_BODY >> 20} MB for images",
++                      file=sys.stderr)
 +            env = dict(env or {}); env["IMG_EMB"] = img_emb_path
 +            print(f"[vision] tower available; embeddings via {img_emb_path}", file=sys.stderr)
          runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)

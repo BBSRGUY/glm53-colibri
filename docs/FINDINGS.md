@@ -364,7 +364,22 @@ order (post-norm is degenerate -- cosine 1.0000, zero spread), the 2D RoPE conve
 identical to the reference), `post_layernorm` placement after the blocks, and the
 full-grid stride-2 downsample (equivalent to the reference's per-block reshape).
 
-**Not yet covered:** real photographs, multiple images per turn, video
+**Verified on real inputs.** A 3072x4080 phone photo of a Sudoku book: the model
+read the printed caption off it -- *"page 7 from a book titled 1,000++ All HARD
+Sudoku Puzzles by amazon.com/djape"* -- and counted six puzzles in a 2x3 layout,
+correctly. Two images in one turn inject as 512 placeholders (prompt 539 tokens)
+and both are described. Three consecutive turns alternating art / sudoku / art
+each described their own image, with the two art turns byte-identical: no stale
+image leaks between requests, which given findings #10 and #14 was the likeliest
+place for a third stale-state bug.
+
+**A 4 MB request cap blocked photographs entirely.** `MAX_BODY = 4 << 20` predates
+vision; a 3072x4080 JPEG is ~8.4 MB base64 and the connection was dropped before
+any handler ran. Now env-configurable (`COLI_MAX_BODY`) and raised to 32 MB
+automatically when the tower is available, leaving the text-serving default alone.
+
+**Not yet covered:** accuracy degrades with two images (a layout the single-image
+run counted correctly came back as "four puzzles in a 2x2 grid"), video
 (`temporal_patch_size` 2 is exercised only by frame replication), and any numeric
 comparison against a GLM-5.3 reference, which still does not exist.
 
